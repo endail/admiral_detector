@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Admiral Domain Detector periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

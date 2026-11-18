@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail;
+
+#region Constants
+readonly ADLIST_FILE="/var/lib/admiral_detector/admiral_domains.list";
+readonly ADLIST_URI="file://${ADLIST_FILE}";
+readonly STAGED_COMMENT="Admiral Detector staged";
+readonly PIHOLE_BIN="/usr/local/bin/pihole";
+readonly PIHOLE_FTL_BIN="/usr/bin/pihole-FTL";
+readonly GRAVITY_DB="/etc/pihole/gravity.db";
+#endregion
+
+main() {
+
+    if [[ ! -f "${ADLIST_FILE}" ]]; then
+        echo "Domain list file not found: ${ADLIST_FILE}" >&2;
+        exit 1;
+    fi;
+
+    if [[ ! -f "${GRAVITY_DB}" ]]; then
+        echo "Pi-hole gravity database not found: ${GRAVITY_DB}" >&2;
+        exit 1;
+    fi;
+
+    if [[ -x "${PIHOLE_FTL_BIN}" ]]; then
+        "${PIHOLE_FTL_BIN}" gravity checkList "${ADLIST_FILE}";
+    fi;
+
+    python3 - "${ADLIST_FILE}" "${ADLIST_URI}" "${GRAVITY_DB}" "${PIHOLE_BIN}" "${STAGED_COMMENT}" << 'PYEOF'
+#!/usr/bin/env python3
+import re
+import sqlite3
+import subprocess
+import sys
+
+DOMAIN_REGEX = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+WILDCARD_DOMAIN_TYPE = 3
+WILDCARD_PREFIX = r"(\.|^)"
+WILDCARD_SUFFIX = "$"
+
+
+def domain_to_wildcard(domain: str) -> str:
+    return f"{WILDCARD_PREFIX}{re.escape(domain)}{WILDCARD_SUFFIX}"
+
+
+def wildcard_to_domain(pattern: str) -> str:
+    if(pattern.startswith(WILDCARD_PREFIX) and pattern.endswith(WILDCARD_SUFFIX)):
+        inner = pattern[len(WILDCARD_PREFIX):-len(WILDCARD_SUFFIX)]
+        return inner.replace(r"\.", ".")
+    return pattern
+
+
+def load_list_domains(adlist_path: str) -> set[str]:
+
+    domains: set[str] = set()
+    with open(adlist_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            cleaned = line.strip().lower().rstrip(".")
+            if(cleaned and not cleaned.startswith("#") and DOMAIN_REGEX.match(cleaned)):
+                domains.add(cleaned)
+
+    return domains
+
+
+def main() -> None:
+
+    adlist_path = sys.argv[1]
+    adlist_uri = sys.argv[2]
+    db_path = sys.argv[3]
+    pihole_bin = sys.argv[4]
+    staged_comment = sys.argv[5]
+
+    list_domains = load_list_domains(adlist_path)
+    changed = False
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id FROM adlist WHERE address = ?", (adlist_uri,))
+        adlist_row = cursor.fetchone()
+        adlist_id = adlist_row[0] if adlist_row else None
+
+        compiled_domains: set[str] = set()
+        if(adlist_id is not None):
+            cursor.execute("SELECT domain FROM gravity WHERE adlist_id = ?", (adlist_id,))
+            compiled_domains = {str(row[0]).lower() for row in cursor.fetchall()}
+
+        cursor.execute(
+            "SELECT id, domain FROM domainlist WHERE type = ? AND comment = ?",
+            (WILDCARD_DOMAIN_TYPE, staged_comment),
+        )
+        staged_rows = cursor.fetchall()
+
+        stale_ids: list[int] = []
+        active_staged_domains: set[str] = set()
+        for row_id, pattern in staged_rows:
+            domain = wildcard_to_domain(str(pattern)).lower()
+            if(domain in compiled_domains or domain not in list_domains):
+                stale_ids.append(int(row_id))
+            else:
+                active_staged_domains.add(domain)
+
+        if(stale_ids):
+            placeholders = ",".join("?" for _ in stale_ids)
+            cursor.execute(f"DELETE FROM domainlist WHERE id IN ({placeholders})", stale_ids)
+            conn.commit()
+            changed = True
+            print(f"Removed {len(stale_ids)} compiled/stale staged denylist entry/entries.")
+
+        domains_to_stage = sorted(list_domains - compiled_domains - active_staged_domains)
+
+    if(domains_to_stage):
+        subprocess.run([pihole_bin, "denylist", "--wild", "-q", *domains_to_stage], check=True)
+        staged_patterns = [domain_to_wildcard(d) for d in domains_to_stage]
+        placeholders = ",".join("?" for _ in staged_patterns)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                f"UPDATE domainlist SET comment = ? "
+                f"WHERE type = ? AND (comment IS NULL OR comment = '') AND domain IN ({placeholders})",
+                [staged_comment, WILDCARD_DOMAIN_TYPE, *staged_patterns],
+            )
+            conn.commit()
+        changed = True
+        print(f"Staged {len(domains_to_stage)} new domain(s) in Pi-hole denylist: {', '.join(domains_to_stage)}")
+
+    if(changed):
+        subprocess.run([pihole_bin, "reloadlists"], check=True)
+        print("Reloaded Pi-hole lists.")
+    else:
+        print("Pi-hole denylist already in sync; no reload required.")
+
+
+if(__name__ == "__main__"):
+    main()
+PYEOF
+
+}
+
+main "$@";

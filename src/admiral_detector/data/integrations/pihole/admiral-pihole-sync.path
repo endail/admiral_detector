@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch Admiral Domain List for New Domains
+
+[Path]
+PathModified=/var/lib/admiral_detector/admiral_domains.list
+Unit=admiral-pihole-sync.service
+
+[Install]
+WantedBy=multi-user.target
