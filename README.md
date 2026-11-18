@@ -1,146 +1,201 @@
-# Admiral Detector
+# admiral_detector
 
-A modular, proactive detector for Admiral (Leven Labs) dynamic anti-adblock domains.
-
-`admiral_detector` fetches configured publisher URLs, extracts candidate third-party domains using one or more configurable parsing strategies, optionally verifies domain ownership via RDAP (with persistent caching and full redirect telemetry), writes a structured JSON report to an ephemeral RAM disk (`/run/admiral_detector/detected_domains.json`), and triggers executable post-processing hooks in `/etc/admiral_detector/post.d/`.
+`admiral_detector` is a Python tool and `systemd` service that scans configured publisher websites to detect dynamically rotated Admiral (Leven Labs) anti-adblock domains, verifies domain registrations via RDAP, and outputs structured JSON metadata with optional post-run hooks and Pi-hole integration.
 
 ---
 
-## Installation & Upgrading
+## Features
 
-### Fresh Installation (Virtual Environment)
+- **Modular Detection Strategies:** Extracts candidate anti-adblock domains from inline scripts, obfuscated payloads, and script heuristics.
+- **RDAP Verification & Caching:** Validates candidate domains against RDAP endpoints (such as `rdap.org` and registrar servers) with local JSON caching to avoid redundant lookups.
+- **Privilege-Separated `systemd` Service:** Runs scheduled scans under a dedicated, unprivileged `admiral` system account with hardened `systemd` unit restrictions.
+- **Zero-Rebuild Pi-hole Integration:** Stages newly discovered domains immediately into Pi-hole's wildcard denylist (`pihole reloadlists`) without triggering slow `pihole -g` gravity rebuilds, then automatically cleans up staged entries once weekly gravity runs ingest the local adlist.
+- **Packaged Setup CLI:** Includes `admiral-detector-setup` to provision, update, or cleanly remove `systemd` units and Pi-hole integration interactively or non-interactively.
+
+---
+
+## Requirements
+
+- **Python:** 3.11 or newer
+- **Python Dependencies** (installed automatically via `pyproject.toml`):
+  - `beautifulsoup4 >= 4.12.0`
+  - `httpx >= 0.25.0`
+  - `tldextract >= 3.4.0`
+  - `dnspython >= 2.3.0`
+- **Optional System Integrations:**
+  - Linux with `systemd` (for scheduled background execution)
+  - Pi-hole with `/usr/local/bin/pihole` and `/etc/pihole/gravity.db` (for automatic DNS blocking)
+
+---
+
+## Project Structure
+
+```text
+admiral_detector/
+├── Makefile
+├── pyproject.toml
+├── README.md
+├── LICENSE
+├── admiral_detector.conf.barebones.example
+├── admiral_detector.conf.full.example
+└── src/
+    └── admiral_detector/
+        ├── __init__.py
+        ├── cli.py
+        ├── config.py
+        ├── logger.py
+        ├── network.py
+        ├── output.py
+        ├── rdap.py
+        ├── setup_cli.py
+        ├── strategies/
+        └── data/
+            ├── systemd/
+            │   ├── admiral-detector.service
+            │   └── admiral-detector.timer
+            └── integrations/
+                └── pihole/
+                    ├── 99-update-admiral-adlist.sh
+                    ├── admiral-pihole-sync
+                    ├── admiral-pihole-sync.path
+                    └── admiral-pihole-sync.service
+```
+
+---
+
+## Installation
+
+### Option 1: From a Local Git Checkout (`Makefile`)
+
+1. Clone the repository and create the isolated virtual environment:
+   ```bash
+   git clone https://github.com/<your-username>/admiral_detector.git
+   cd admiral_detector
+   make venv
+   ```
+
+2. Run the interactive setup wizard (provisions the `admiral` system user, `/etc/admiral_detector/`, `systemd` timer/service, and optional Pi-hole sync):
+   ```bash
+   sudo make setup
+   ```
+
+   Alternatively, run one of the non-interactive `Makefile` targets:
+   ```bash
+   sudo make setup-all          # Core detector + Pi-hole sync integration
+   sudo make setup-detector     # Core detector service only
+   sudo make setup-pihole-sync  # Add Pi-hole sync to an existing detector setup
+   ```
+
+### Option 2: Installed via `pipx` or a Dedicated Virtual Environment
+
+If installing from a built wheel or PyPI package without a local repository checkout:
+
 ```bash
-python3 build_admiral_detector.py
-cd admiral_detector
-python3 -m venv .venv
-.venv/bin/pip install -e .
+pipx install admiral-detector
+sudo "$(which admiral-detector-setup)"
 ```
 
-### Replacing an Existing `admiral-blocker` Installation
-```bash
-# 1. Uninstall the old package from your existing virtual environment
-~/projects/admiral_blocker/.venv/bin/pip uninstall -y admiral-blocker
-
-# 2. Generate and install admiral_detector in a clean project directory
-mkdir -p ~/projects && cd ~/projects
-python3 /path/to/build_admiral_detector.py
-cd admiral_detector
-python3 -m venv .venv
-.venv/bin/pip install -e .
-```
-
----
-
-## Usage
+Or using a system-wide virtual environment:
 
 ```bash
-admiral-detector -c /etc/admiral_detector/admiral_detector.conf
+sudo python3 -m venv /opt/admiral_detector/.venv
+sudo /opt/admiral_detector/.venv/bin/pip install admiral-detector
+sudo /opt/admiral_detector/.venv/bin/admiral-detector-setup
 ```
 
-### CLI Options
-- `-c`, `--config`: Path to the INI configuration file (default: `/etc/admiral_detector/admiral_detector.conf`).
-- `-v`, `--version`: Print the installed `admiral_detector` package version and exit.
+---
+
+## Configuration
+
+During setup, a default configuration file is created at `/etc/admiral_detector/admiral_detector.conf` (`0640 root:admiral`) if one does not already exist. Reference templates are included in the repository root:
+
+- `admiral_detector.conf.barebones.example` — minimal configuration for quick setup.
+- `admiral_detector.conf.full.example` — all supported options, including custom request headers, user agents, HTTP/SOCKS proxies, redirect limits, regex ignore lists, and RDAP cache tuning.
+
+> **Note:** If you replace `/etc/admiral_detector/admiral_detector.conf` with `admiral_detector.conf.barebones.example` while using Pi-hole sync, ensure `post_script_dir = /etc/admiral_detector/post.d/` is present under `[general]` so the post-scan hook executes.
 
 ---
 
-## Configuration Reference
+## Usage & Service Management
 
-Configuration uses standard INI syntax (`key = value`). Two reference templates are included in the root project directory:
-- `admiral_detector.conf.barebones.example` — minimal working setup relying on built-in defaults.
-- `admiral_detector.conf.full.example` — exhaustive reference documenting all sections and options.
+### Ad-Hoc CLI Execution
 
-### `[general]` Section
-
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `output_file` | string | `/run/admiral_detector/detected_domains.json` | Destination path for the structured JSON detection report. Set empty (`output_file =`) to disable JSON output. |
-| `post_script_dir` | string | `None` | Directory of executable hook scripts invoked in lexical order with `output_file` passed as `$1`. |
-
-### `[defaults]` Section
-
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `strategy` | CSV | `inline_script` | Comma-separated list of extraction strategies applied to publishers without an explicit `strategy`. |
-| `ignore_domains` | CSV | `""` | Comma-separated apex domains or `regex:<pattern>` rules ignored globally unless overridden by a publisher. |
-| `header_<Name>` | string | Chrome `User-Agent` | Default custom HTTP header applied to all requests (e.g., `header_user_agent`, `header_accept-encoding`). Header names are normalised to canonical `Title-Case` (such as `User-Agent` and `Accept-Encoding`) and overridden case-insensitively by profile or publisher headers. |
-
-### `[rdap]` Section
-
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `verify` | bool | `false` | Whether to verify extracted domains against RDAP registration records (`Leven Labs` / `Admiral`). |
-| `domain` | string | `rdap.org` | Bootstrap RDAP server hostname queried via `https://<domain>/domain/<apex>`. |
-| `cache_file` | string | `/var/lib/admiral_detector/rdap_cache.json` | Persistent JSON cache for RDAP lookup results (falls back to `/tmp/admiral_detector_rdap_cache.json` if unwritable). |
-| `cache_ttl_seconds` | int | `2592000` | Time-to-live for cached RDAP results in seconds (default: 30 days). Transient network or HTTP errors are never cached. |
-
-### `[network]` Section
-
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `timeout_seconds` | int | `15` | Maximum request timeout in seconds for HTTP and RDAP requests. |
-| `max_redirects` | int | `5` | Maximum HTTP redirects to follow per request. |
-| `proxy` | string | `None` | Optional HTTP/SOCKS proxy URL (e.g., `http://127.0.0.1:8080`). |
-| `dns` | string | `None` | Optional custom DNS resolver IP (e.g., `1.1.1.1` or `1.1.1.1:5353`) used for hostname resolution while preserving TLS SNI. |
-| `allow_insecure` | bool | `false` | Allow plaintext `http://` URLs and disable strict TLS certificate verification on publisher fetches. |
-
-### `[logging]` Section
-
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `level` | string | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
-| `file` | string | `None` | Optional file path for persistent log output in addition to stdout. |
-
-### `[profiles]` and `[profile:<name>]` Sections
-Define reusable sets of HTTP headers to avoid repetition across multiple `[publisher:<name>]` sections:
-
-```ini
-[profiles]
-[profile:desktop_chrome]
-header_user_agent = Mozilla/5.0 ...
-header_accept-language = en-AU,en-US;q=0.9,en;q=0.8
+```bash
+admiral-detector --version
+admiral-detector --help
+admiral-detector -c /path/to/custom.conf
 ```
 
-Reference a profile inside any `[publisher:<name>]` section with `profile = desktop_chrome`. Headers in a profile override `[defaults]` case-insensitively (with canonical `Title-Case` header names), and headers defined directly inside `[publisher:<name>]` override the profile.
+### Managing the `systemd` Service
 
-### `[publishers]` Section
-A simple newline-separated list of target URLs or bare domains (bare domains automatically assume `https://`). Query strings containing `=` and explicit ports (e.g., `https://example.com:8443/path?a=1`) are preserved intact. All entries in `[publishers]` inherit `[defaults]`, `[rdap]`, and `[network]`.
+Check timer schedule and service status:
+```bash
+systemctl status admiral-detector.timer
+systemctl status admiral-detector.service
+```
 
-### `[publisher:<name>]` Sections
-Per-publisher configuration supporting isolated overrides of global defaults (overrides apply strictly to that publisher and never persist to subsequent publishers):
+Trigger an immediate detection scan using the system configuration:
+```bash
+sudo systemctl start admiral-detector.service
+```
 
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `url` | string | *(required)* | Target URL or bare domain (with optional `:port`, path, and query string). |
-| `strategy` | CSV | `[defaults]` `strategy` | Comma-separated list of extraction strategies for this publisher. |
-| `ignore_domains` | CSV | `[defaults]` `ignore_domains` | Replaces `[defaults]` `ignore_domains` for this publisher only. Set empty (`ignore_domains =`) to ignore nothing. |
-| `profile` | string | `None` | Name of a `[profile:<name>]` header set to layer over `[defaults]`. |
-| `verify_rdap` | bool | `[rdap]` `verify` | Overrides RDAP verification for this publisher (`verify` is also accepted). |
-| `rdap_domain` | string | `[rdap]` `domain` | Overrides the RDAP bootstrap server hostname for this publisher. |
-| `timeout_seconds` | int | `[network]` `timeout_seconds` | Overrides request timeout in seconds for this publisher. |
-| `max_redirects` | int | `[network]` `max_redirects` | Overrides maximum redirects for this publisher. |
-| `proxy` | string | `[network]` `proxy` | Overrides proxy URL for this publisher. Set empty (`proxy =`) to bypass a global proxy. |
-| `dns` | string | `[network]` `dns` | Overrides custom DNS resolver for this publisher. Set empty (`dns =`) to use system DNS. |
-| `allow_insecure` | bool | `[network]` `allow_insecure` | Overrides plaintext HTTP allowance and TLS certificate verification for this publisher. |
-| `header_<Name>` | string | — | Publisher-specific HTTP header override (highest precedence). |
+View scan and Pi-hole sync logs:
+```bash
+journalctl -u admiral-detector.service -n 50 --no-pager
+journalctl -u admiral-pihole-sync.service -n 50 --no-pager
+```
 
 ---
 
-## Extraction Strategies
+## How Pi-hole Sync Works
 
-- `inline_script`: Inspects inline `<script>` blocks containing Admiral loader markers (`__apNoHold`, `decodeURI`, `admiral`, `leven`, `atob(`) and extracts third-party apex domains from URLs (supporting `.js`, extensionless paths, ports, query strings, fragments, and escaped slashes).
-- `all_js_domains`: Extracts all third-party apex domains referenced across any inline `<script>` tag on the page.
-- `obfuscated_inline`: Decodes Base64 blobs inside inline `<script>` tags and extracts embedded third-party apex domains.
-- `external_script`: Extracts apex domains from `<script src="...">` tags.
-- `broad_heuristic`: Multi-pass URI-decodes the entire HTML document and extracts all third-party HTTP(S) apex domains.
-- `all_domains`: Scans the raw HTML document for all third-party HTTP(S) apex domains.
+When Pi-hole integration is enabled, domain updates flow across two privilege boundaries:
 
-Multiple strategies can be combined as a comma-separated list (for example, `strategy = inline_script, obfuscated_inline`). The page is fetched once, all configured strategies run against the response, and extracted apex domains are deduplicated while recording which strategies matched each domain in `matched_strategies`.
+1. **Detection (`admiral` user):** `admiral-detector.service` writes JSON results to `/run/admiral_detector/detected_domains.json` and runs `/etc/admiral_detector/post.d/99-update-admiral-adlist.sh`, which atomically updates `/var/lib/admiral_detector/admiral_domains.list`.
+2. **Path Activation (`root`):** `admiral-pihole-sync.path` monitors `/var/lib/admiral_detector/admiral_domains.list` via `inotify` and triggers `admiral-pihole-sync.service` (`/usr/local/sbin/admiral-pihole-sync`).
+3. **Hybrid Blocking:**
+   - `file:///var/lib/admiral_detector/admiral_domains.list` is registered as a Pi-hole adlist (`Admiral Detector domains`).
+   - Any domain not yet compiled into `gravity.db` is validated with `pihole-FTL gravity checkList`, added to the wildcard denylist (`pihole denylist --wild -q`) with the comment `Admiral Detector staged`, and activated immediately via `pihole reloadlists`.
+   - Once Pi-hole's scheduled weekly `pihole -g` run ingests the adlist into `gravity.db`, subsequent sync runs automatically remove the redundant staged denylist entries.
 
 ---
 
-## URL Validation & Protocol Rules
+## Setup CLI Reference
 
-- Bare domains without a scheme (e.g., `techcrunch.com` or `example.com:8443/news`) automatically assume `https://`.
-- Explicit ports (e.g., `https://www.google.com:8080`) are supported and preserved.
-- Plaintext `http://` URLs are rejected by default unless `allow_insecure = true` is set in `[network]` or on that publisher section (which permits the URL, disables strict TLS verification for that target, and logs a warning).
-- Non-HTTP(S) schemes (`file://`, `ftp://`, `javascript:`, `data:`, etc.) are unconditionally rejected.
+`admiral-detector-setup` supports the following flags:
+
+| Flag | Description |
+| :--- | :--- |
+| `-y`, `--non-interactive` | Run without prompts using defaults or explicit flags |
+| `--bin-path <path>` | Explicitly specify the `admiral-detector` executable to symlink to `/usr/local/bin/admiral-detector` |
+| `--with-pihole-sync` | Configure the Pi-hole adlist and denylist sync integration |
+| `--without-pihole-sync` | Skip configuring the Pi-hole sync integration |
+| `--pihole-sync-only` | Configure only the Pi-hole sync integration (assumes core detector is already installed) |
+| `--run-now` | Trigger an immediate detection scan after setup completes |
+| `--uninstall-pihole-sync` | Remove only the Pi-hole sync units, hook, helper, and `gravity.db` entries |
+| `--uninstall` | Remove services, symlink, and Pi-hole integration while preserving `/etc/admiral_detector` and `/var/lib/admiral_detector` |
+| `--purge` | Completely remove services, Pi-hole integration, configuration, state, logs, and the `admiral` system user |
+
+---
+
+## Uninstalling
+
+Remove system services and Pi-hole entries while keeping your configuration and domain history:
+```bash
+sudo make uninstall
+# or: sudo "$(which admiral-detector-setup)" -y --uninstall
+```
+
+Remove everything including configuration, cached RDAP data, logs, and the `admiral` system user:
+```bash
+sudo make purge
+# or: sudo "$(which admiral-detector-setup)" -y --purge
+```
+
+Finally, remove the Python virtual environment (`rm -rf .venv` or `pipx uninstall admiral-detector`).
+
+---
+
+## License
+
+See [LICENSE](LICENSE) for details.

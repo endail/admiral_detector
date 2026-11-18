@@ -27,11 +27,14 @@ POST_SCRIPT_DEST = f"{POST_SCRIPT_DIR}/{POST_SCRIPT_NAME}"
 
 STATE_DIR = "/var/lib/admiral_detector"
 LOG_DIR = "/var/log/admiral_detector"
-DEFAULT_OUTPUT_FILE = "/run/admiral_detector/detected_domains.json"
+RUNTIME_DIR = "/run/admiral_detector"
+DEFAULT_OUTPUT_FILE = f"{RUNTIME_DIR}/detected_domains.json"
 
 ADLIST_FILE = f"{STATE_DIR}/admiral_domains.list"
 ADLIST_URI = f"file://{ADLIST_FILE}"
 ADLIST_COMMENT = "Admiral Detector domains"
+STAGED_COMMENT = "Admiral Detector staged"
+WILDCARD_DOMAIN_TYPE = 3
 
 PIHOLE_BIN = "/usr/local/bin/pihole"
 GRAVITY_DB = "/etc/pihole/gravity.db"
@@ -102,6 +105,15 @@ def ensure_directory(path: str, uid: int, gid: int, mode: int) -> None:
     os.makedirs(path, exist_ok=True)
     os.chown(path, uid, gid)
     os.chmod(path, mode)
+
+
+def remove_file_if_exists(path: str) -> bool:
+
+    if(os.path.lexists(path)):
+        os.unlink(path)
+        return True
+
+    return False
 
 
 def pihole_detected() -> bool:
@@ -276,12 +288,106 @@ def setup_pihole_sync() -> None:
 #endregion
 
 
+#region Uninstall & Purge
+def uninstall_pihole_sync() -> None:
+
+    print("--- Removing Pi-hole Sync Integration ---")
+    subprocess.run(["systemctl", "disable", "--now", PIHOLE_SYNC_PATH_UNIT], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "stop", PIHOLE_SYNC_SERVICE_UNIT], check=False, stderr=subprocess.DEVNULL)
+
+    for unit_name in (PIHOLE_SYNC_PATH_UNIT, PIHOLE_SYNC_SERVICE_UNIT):
+        dest_path = f"{SYSTEMD_DIR}/{unit_name}"
+        if(remove_file_if_exists(dest_path)):
+            print(f"Removed {dest_path}")
+
+    if(remove_file_if_exists(POST_SCRIPT_DEST)):
+        print(f"Removed {POST_SCRIPT_DEST}")
+
+    if(remove_file_if_exists(SYNC_HELPER_DEST)):
+        print(f"Removed {SYNC_HELPER_DEST}")
+
+    if(os.path.isfile(GRAVITY_DB)):
+        db_changed = False
+        with sqlite3.connect(GRAVITY_DB) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM adlist WHERE address = ?", (ADLIST_URI,))
+            adlist_row = cursor.fetchone()
+            if(adlist_row is not None):
+                adlist_id = int(adlist_row[0])
+                cursor.execute("DELETE FROM gravity WHERE adlist_id = ?", (adlist_id,))
+                cursor.execute("DELETE FROM adlist WHERE id = ?", (adlist_id,))
+                db_changed = True
+
+            cursor.execute(
+                "DELETE FROM domainlist WHERE type = ? AND comment = ?",
+                (WILDCARD_DOMAIN_TYPE, STAGED_COMMENT),
+            )
+            if(cursor.rowcount > 0):
+                db_changed = True
+
+            conn.commit()
+
+        if(db_changed):
+            print("Removed Admiral adlist and staged denylist entries from Pi-hole.")
+            if(os.path.isfile(PIHOLE_BIN) and os.access(PIHOLE_BIN, os.X_OK)):
+                subprocess.run([PIHOLE_BIN, "reloadlists"], check=False)
+
+
+def uninstall_core_detector(purge: bool) -> None:
+
+    print("\n--- Removing Core Detector Service ---")
+    subprocess.run(["systemctl", "disable", "--now", DETECTOR_TIMER_UNIT], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "stop", DETECTOR_SERVICE_UNIT], check=False, stderr=subprocess.DEVNULL)
+
+    for unit_name in (DETECTOR_TIMER_UNIT, DETECTOR_SERVICE_UNIT):
+        dest_path = f"{SYSTEMD_DIR}/{unit_name}"
+        if(remove_file_if_exists(dest_path)):
+            print(f"Removed {dest_path}")
+
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "reset-failed"], check=False, stderr=subprocess.DEVNULL)
+
+    if(os.path.islink(TARGET_BIN)):
+        os.unlink(TARGET_BIN)
+        print(f"Removed symlink {TARGET_BIN}")
+
+    if(os.path.exists(RUNTIME_DIR)):
+        shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
+
+    if(purge):
+        print("\n--- Purging Configuration, State, Logs, and Service Account ---")
+        for directory in (CONFIG_DIR, STATE_DIR, LOG_DIR):
+            if(os.path.exists(directory)):
+                shutil.rmtree(directory)
+                print(f"Removed directory {directory}")
+
+        try:
+            pwd.getpwnam(SERVICE_USER)
+            subprocess.run(["userdel", SERVICE_USER], check=True)
+            print(f"Removed system user: {SERVICE_USER}")
+        except KeyError:
+            pass
+
+        try:
+            grp.getgrnam(SERVICE_GROUP)
+            subprocess.run(["groupdel", SERVICE_GROUP], check=True)
+            print(f"Removed system group: {SERVICE_GROUP}")
+        except KeyError:
+            pass
+    else:
+        print(
+            f"\nPreserved configuration, domain lists, and logs in {CONFIG_DIR}, {STATE_DIR}, and {LOG_DIR}."
+        )
+        print("Re-run with '--purge' to delete those directories and the 'admiral' system user.")
+#endregion
+
+
 #region Entry Point
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         prog="admiral-detector-setup",
-        description="Provision systemd services and optional Pi-hole sync for admiral_detector.",
+        description="Provision or remove systemd services and optional Pi-hole sync for admiral_detector.",
     )
     parser.add_argument(
         "-y",
@@ -295,21 +401,36 @@ def parse_args() -> argparse.Namespace:
         help="Path to the admiral-detector executable to symlink to /usr/local/bin/admiral-detector.",
     )
 
-    pihole_group = parser.add_mutually_exclusive_group()
-    pihole_group.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--with-pihole-sync",
         action="store_true",
         help="Configure the Pi-hole adlist and denylist sync integration.",
     )
-    pihole_group.add_argument(
+    mode_group.add_argument(
         "--without-pihole-sync",
         action="store_true",
         help="Skip configuring the Pi-hole sync integration.",
     )
-    pihole_group.add_argument(
+    mode_group.add_argument(
         "--pihole-sync-only",
         action="store_true",
         help="Only configure the Pi-hole sync integration (assumes core detector is already set up).",
+    )
+    mode_group.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove systemd units, binary symlink, and Pi-hole integration while keeping config and data.",
+    )
+    mode_group.add_argument(
+        "--purge",
+        action="store_true",
+        help="Completely remove services, Pi-hole integration, config, state, logs, and the admiral user.",
+    )
+    mode_group.add_argument(
+        "--uninstall-pihole-sync",
+        action="store_true",
+        help="Remove only the Pi-hole sync integration while keeping the core detector running.",
     )
 
     parser.add_argument(
@@ -326,6 +447,25 @@ def main() -> None:
     require_root()
 
     interactive = (not args.non_interactive) and sys.stdin.isatty()
+
+    if(args.uninstall_pihole_sync):
+        uninstall_pihole_sync()
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+        print("\nPi-hole sync integration removed.")
+        return
+
+    if(args.uninstall or args.purge):
+        purge = args.purge
+        if(interactive and not purge):
+            purge = prompt_yes_no(
+                f"Also delete configuration, domain lists, logs ({CONFIG_DIR}, {STATE_DIR}, {LOG_DIR}), and the '{SERVICE_USER}' user?",
+                False,
+            )
+        uninstall_pihole_sync()
+        uninstall_core_detector(purge)
+        print("\nUninstall complete. To remove the Python package itself, delete its virtual environment (e.g. 'rm -rf .venv') or run 'pipx uninstall admiral-detector'.")
+        return
+
     configure_pihole = args.with_pihole_sync or args.pihole_sync_only
     run_now = args.run_now
 
