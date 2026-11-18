@@ -1,0 +1,6 @@
+[general]
+output_file = /run/admiral_detector/detected_domains.json
+
+[publishers]
+techcrunch.com
+https://www.geelongadvertiser.com.au/nocookies?a=A.flavipes

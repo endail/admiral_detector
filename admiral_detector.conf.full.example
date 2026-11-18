@@ -1,0 +1,67 @@
+[general]
+output_file = /run/admiral_detector/detected_domains.json
+post_script_dir = /etc/admiral_detector/post.d/
+
+[defaults]
+strategy = inline_script
+ignore_domains = forms.gle, pubimgs.net, regex:\.google\.com$
+header_user_agent = Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+header_accept-encoding = gzip, deflate, br
+
+[rdap]
+verify = true
+domain = rdap.org
+cache_file = /var/lib/admiral_detector/rdap_cache.json
+cache_ttl_seconds = 2592000
+
+[network]
+timeout_seconds = 15
+max_redirects = 5
+# proxy = http://127.0.0.1:8080
+# dns = 1.1.1.1
+allow_insecure = false
+
+[logging]
+level = INFO
+file = /var/log/admiral_detector/admiral_detector.log
+
+[profiles]
+[profile:news_corp_bot_bypass]
+header_accept = text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+header_accept-language = en-AU,en-US;q=0.9,en;q=0.8
+header_priority = u=0, i
+header_sec-ch-ua = "Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"
+header_sec-ch-ua-mobile = ?0
+header_sec-ch-ua-platform = "Windows"
+header_sec-fetch-dest = document
+header_sec-fetch-mode = navigate
+header_sec-fetch-site = none
+header_sec-fetch-user = ?1
+header_upgrade-insecure-requests = 1
+header_user_agent = Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36
+
+[publishers]
+https://www.geelongadvertiser.com.au/nocookies?a=A.flavipes
+techcrunch.com
+
+[publisher:dailytelegraph.com.au]
+url = https://www.dailytelegraph.com.au/nocookies?a=A.flavipes
+strategy = inline_script, obfuscated_inline
+profile = news_corp_bot_bypass
+verify_rdap = true
+ignore_domains = regex:\.newscdn\.com\.au$
+
+[publisher:heraldsun.com.au]
+url = https://www.heraldsun.com.au/nocookies?a=A.flavipes
+strategy = inline_script
+profile = news_corp_bot_bypass
+# Clear default ignore_domains for this publisher only:
+ignore_domains =
+
+[publisher:news.com.au]
+url = https://www.news.com.au
+strategy = all_js_domains
+profile = news_corp_bot_bypass
+# dns = 9.9.9.9
+# proxy = http://127.0.0.1:8080
+# allow_insecure = false
