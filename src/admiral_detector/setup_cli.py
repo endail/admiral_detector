@@ -217,7 +217,8 @@ def setup_core_detector(source_bin: str) -> None:
     ensure_directory(POST_SCRIPT_DIR, 0, gid, DIR_MODE_RESTRICTED)
     ensure_directory(STATE_DIR, uid, gid, DIR_MODE_PUBLIC)
     ensure_directory(LOG_DIR, uid, gid, DIR_MODE_RESTRICTED)
-    print(f"Configured directories under {CONFIG_DIR}, {STATE_DIR}, and {LOG_DIR}.")
+    ensure_directory(RUNTIME_DIR, uid, gid, DIR_MODE_PUBLIC)
+    print(f"Configured directories under {CONFIG_DIR}, {STATE_DIR}, {LOG_DIR}, and {RUNTIME_DIR}.")
 
     if(not os.path.exists(CONFIG_FILE)):
         write_file_atomic(
