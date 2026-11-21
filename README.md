@@ -4,7 +4,8 @@
 
 ## Features
 
-* **Modular Detection Strategies:** Extracts candidate anti-adblock domains from inline scripts, obfuscated payloads, and script heuristics.
+* **Interactive & Daemon Subcommands:** Run stateless ad-hoc scans directly in your terminal (`admiral-detector scan`) or run scheduled production scans (`admiral-detector daemon`) without colliding with system file permissions or post-scan hooks.
+* **Modular Detection Strategies:** Extracts candidate anti-adblock domains from inline scripts, obfuscated payloads, external script references, and structural heuristics.
 * **RDAP Verification & Caching:** Validates candidate domains against RDAP endpoints (such as `rdap.org` and registrar servers) with local JSON caching to avoid redundant lookups.
 * **Privilege-Separated `systemd` Service:** Runs scheduled scans under a dedicated, unprivileged `admiral` system account with hardened `systemd` unit restrictions.
 * **Zero-Rebuild Pi-hole Integration:** Stages newly discovered domains immediately into Pi-hole's wildcard denylist (`pihole reloadlists`) without triggering slow `pihole -g` gravity rebuilds, then automatically cleans up staged entries once weekly gravity runs ingest the local adlist.
@@ -57,22 +58,25 @@ admiral_detector/
 
 ## Installation
 
-Because the `systemd` daemon runs under the unprivileged `admiral` user (and with `ProtectHome=yes`), the runtime Python virtual environment is installed system-wide in `/opt/admiral_detector/.venv` rather than inside a user's home directory.
+Because the `systemd` daemon runs under the unprivileged `admiral` user (with `ProtectHome=yes`), the runtime Python virtual environment is installed system-wide in `/opt/admiral_detector/.venv` rather than inside a user's home directory.
 
 ### Option 1: From a Local Git Checkout (`Makefile`)
 
 1. Clone the repository:
+
    ```bash
-   git clone https://github.com/<your-username>/admiral_detector.git
+   git clone https://github.com/endail/admiral_detector.git
    cd admiral_detector
    ```
 
 2. Run the interactive setup wizard (creates `/opt/admiral_detector/.venv`, installs `admiral_detector`, provisions the `admiral` system user, `/etc/admiral_detector/`, `systemd` units, and optional Pi-hole sync):
+
    ```bash
    sudo make setup
    ```
 
    Alternatively, run one of the non-interactive `Makefile` targets:
+
    ```bash
    sudo make setup-all          # Core detector + Pi-hole sync integration
    sudo make setup-detector     # Core detector service only
@@ -80,6 +84,7 @@ Because the `systemd` daemon runs under the unprivileged `admiral` user (and wit
    ```
 
 To upgrade an existing installation after pulling new changes from git:
+
 ```bash
 git pull
 sudo make setup
@@ -87,7 +92,7 @@ sudo make setup
 
 ### Option 2: Installed via a Dedicated Virtual Environment or System `pipx`
 
-If installing from a built wheel or PyPI package without a local repository checkout:
+If installing from a built wheel or package without a local repository checkout:
 
 ```bash
 sudo mkdir -p /opt/admiral_detector
@@ -107,37 +112,114 @@ sudo /usr/local/bin/admiral-detector-setup
 
 ## Configuration
 
-During setup, a default configuration file is created at `/etc/admiral_detector/admiral_detector.conf` (`0640 root:admiral`) if one does not already exist. Reference templates are included in the repository root:
+During setup, a system configuration file is created at `/etc/admiral_detector/admiral_detector.conf` (`0640 root:admiral`) if one does not already exist. Reference templates are included in the repository root:
 
 * `admiral_detector.conf.barebones.example` — minimal configuration for quick setup.
 * `admiral_detector.conf.full.example` — all supported options, including custom request headers, user agents, HTTP/SOCKS proxies, redirect limits, regex ignore lists, and RDAP cache tuning.
 
-> **Note:** If you replace `/etc/admiral_detector/admiral_detector.conf` with `admiral_detector.conf.barebones.example` while using Pi-hole sync, ensure `post_script_dir = /etc/admiral_detector/post.d/` is present under `[general]` so the post-scan hook executes.
+> **Note:** If you replace `/etc/admiral_detector/admiral_detector.conf` with `admiral_detector.conf.barebones.example` while using Pi-hole sync, ensure `post_script_dir = /etc/admiral_detector/post.d/` is present so the post-scan hook executes.
 
-## Usage & Service Management
+### Configuration Resolution Precedence
 
-### Ad-Hoc CLI Execution
+* **Ad-Hoc URL Scans (`scan <URL>` without `-c`):** Skips `/etc/admiral_detector/admiral_detector.conf` and `~/.config/` completely, using built-in defaults (`stdout` JSON output, `stderr` logging, user RDAP cache at `~/.cache/admiral_detector/rdap_cache.json`, and disabled post-scan hooks).
+* **Explicit Config (`-c / --config <PATH>`):** Loads the specified INI file (such as `~/admiral.conf`), while allowing any accompanying CLI flags (`--url`, `--strategy`, `--output`, `--no-rdap`, `--proxy`) to override settings in memory.
+* **Default Config Discovery (`scan` with neither URLs nor `-c`):** Checks `~/.config/admiral_detector/admiral_detector.conf` first, then falls back to `/etc/admiral_detector/admiral_detector.conf` if readable by the current user. Even when reading `/etc`, `scan` defaults output to `stdout` and suppresses `post.d/` hooks unless `--run-hooks` is passed.
+* **Daemon Mode (`daemon -c <PATH>`):** Always requires an explicit `-c/--config` path, writes atomically to the configured output file, writes persistent logs to `/var/log/admiral_detector/`, and executes `post.d/` hooks.
+
+## CLI Usage
+
+### Subcommands Overview
+
+| Subcommand | Purpose |
+| :--- | :--- |
+| `admiral-detector scan` | Run an interactive or ad-hoc scan against URLs or a config file (outputs JSON to `stdout` by default). |
+| `admiral-detector daemon` | Run the production scheduled scan invoked by `admiral-detector.service`. |
+| `admiral-detector strategies` | List all available detection strategy modules and their identifiers. |
+| `admiral-detector check-config` | Validate an INI configuration file, regex ignore rules, and directory permissions. |
+
+*(Bare invocations whose first argument is a URL or scan flag automatically default to `admiral-detector scan`.)*
+
+### Interactive & Ad-Hoc Scans (`scan`)
+
+Scan one or more URLs directly and print JSON results to `stdout`:
 
 ```bash
-admiral-detector --version
-admiral-detector --help
-admiral-detector -c /path/to/custom.conf
+admiral-detector scan https://example.com
+# or using the bare shorthand:
+admiral-detector https://example.com
 ```
 
-### Managing the `systemd` Service
+Run specific strategies only, skip RDAP lookups for fast local parsing, and enable verbose debug logs on `stderr`:
+
+```bash
+admiral-detector scan -u https://example.com -s inline_script --no-rdap -v
+```
+
+Scan using a personal configuration file in your home directory:
+
+```bash
+admiral-detector scan -c ~/admiral.conf
+```
+
+Supported `scan` options:
+
+* `URL` (positional) / `-u, --url <URL>` (repeatable) — Target publisher URL(s); overrides `[publishers]`.
+* `-c, --config <PATH>` — Load baseline settings from an INI configuration file.
+* `-s, --strategy <NAME>` (repeatable) — Restrict execution to the named strategy module(s).
+* `-o, --output <PATH>` — Write JSON results to a file instead of `stdout` (`-`).
+* `--no-rdap` — Skip RDAP domain registration verification.
+* `--no-cache` — Bypass reading or writing `~/.cache/admiral_detector/rdap_cache.json`.
+* `--proxy <URL>` — Route HTTP and RDAP requests through an HTTP/HTTPS proxy.
+* `--run-hooks` — Opt-in flag to execute `post_script_dir` hooks after scanning (disabled by default in `scan`).
+* `-v, --verbose` / `-q, --quiet` — Increase (`DEBUG`) or reduce (`ERROR`) log verbosity on `stderr`.
+
+### Production & Dry-Run Execution (`daemon`)
+
+Test the production configuration safely as the `admiral` user without writing state files or triggering Pi-hole updates:
+
+```bash
+sudo -u admiral admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf --dry-run
+```
+
+Run the full production pipeline (used by `admiral-detector.service`):
+
+```bash
+admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf
+```
+
+### Inspecting Strategies & Validating Configs
+
+List registered detection strategies:
+
+```bash
+admiral-detector strategies
+admiral-detector strategies --json
+```
+
+Validate configuration syntax, ignore regexes, and path permissions before reloading the service:
+
+```bash
+admiral-detector check-config -c ~/admiral.conf
+sudo admiral-detector check-config -c /etc/admiral_detector/admiral_detector.conf
+```
+
+## Managing the `systemd` Service
 
 Check timer schedule and service status:
+
 ```bash
 systemctl status admiral-detector.timer
 systemctl status admiral-detector.service
 ```
 
-Trigger an immediate detection scan using the system configuration:
+Trigger an immediate scheduled scan via `systemd`:
+
 ```bash
 sudo systemctl start admiral-detector.service
 ```
 
 View scan and Pi-hole sync logs:
+
 ```bash
 journalctl -u admiral-detector.service -n 50 --no-pager
 journalctl -u admiral-pihole-sync.service -n 50 --no-pager
@@ -173,15 +255,18 @@ When Pi-hole integration is enabled, domain updates flow across two privilege bo
 ## Uninstalling
 
 Remove system services and Pi-hole entries while keeping your configuration and domain history:
+
 ```bash
 sudo make uninstall
 # or: sudo /opt/admiral_detector/.venv/bin/admiral-detector-setup -y --uninstall
 ```
 
 Remove everything including configuration, cached RDAP data, logs, the `admiral` system user, and `/opt/admiral_detector`:
+
 ```bash
 sudo make purge
 ```
+
 *(If uninstalling without the `Makefile`, run `sudo /opt/admiral_detector/.venv/bin/admiral-detector-setup -y --purge` followed by `sudo rm -rf /opt/admiral_detector`.)*
 
 ## License
