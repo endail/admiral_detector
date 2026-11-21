@@ -1,25 +1,35 @@
-#!/usr/bin/env python3
-"""Command-line interface for admiral_detector."""
-
-from __future__ import annotations
-
 import argparse
+import datetime
 import json
 import logging
-import os
-from pathlib import Path
-import subprocess
+import re
 import sys
-from typing import Any
+import time
+from typing import Any, Dict, List, Optional, Set
 
-from admiral_detector.config import (
+from . import __version__ as FALLBACK_VERSION
+from .config import (
     STDOUT_TARGET,
+    STRATEGY_DESCRIPTIONS,
     SYSTEM_CONFIG_PATH,
-    RuntimeConfig,
-    build_scan_config,
-    load_ini_config,
+    TargetSite,
+    build_scan_targets_and_opts,
+    load_config,
+    parse_cli_strategies,
     validate_config_file,
 )
+from .logger import setup_logger
+from .network import create_http_client, use_dns
+from .output import run_post_scripts, write_json_output
+from .rdap import RDAPCache, verify_domain_rdap
+from .strategies.factory import get_strategy
+
+try:
+    from importlib.metadata import version
+
+    PKG_VERSION = version("admiral_detector")
+except Exception:
+    PKG_VERSION = FALLBACK_VERSION
 
 
 # region Constants
@@ -29,191 +39,321 @@ EXIT_ERROR = 1
 EXIT_USAGE = 2
 
 KNOWN_SUBCOMMANDS = {"scan", "daemon", "strategies", "check-config"}
-HELP_FLAGS = {"-h", "--help"}
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+PASSTHROUGH_FLAGS = {"-h", "--help", "-V", "--version"}
 
 # endregion
 
 
-# region Logging & Output Helpers
+# region Detection Pipeline
 
-def _configure_logging(config: RuntimeConfig, verbosity: int, quiet: bool, daemon_mode: bool) -> None:
-    """Initialise console (stderr) or daemon file logging."""
-
-    if(quiet):
-        level = logging.ERROR
-    elif(verbosity > 0):
-        level = logging.DEBUG
-    else:
-        level = logging.INFO
-
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
-
-    if(daemon_mode and config.log_dir is not None):
-        config.log_dir.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(config.log_dir / "admiral_detector.log", encoding="utf-8"))
-
-    logging.basicConfig(level=level, format=LOG_FORMAT, handlers=handlers, force=True)
+def is_ignored(domain: str, ignore_domains: Set[str], ignore_regexes: List[re.Pattern]) -> bool:
+    if(domain in ignore_domains):
+        return True
+    for regex in ignore_regexes:
+        if(regex.search(domain)):
+            return True
+    return False
 
 
-def _write_results(payload: dict[str, Any], output_path: str) -> None:
-    """Serialise scan payload to stdout or atomically to a target file."""
+def run_detection_pipeline(
+    targets: List[TargetSite],
+    global_opts: Dict[str, Any],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Execute HTTP fetching, strategy extraction, and RDAP verification for all targets."""
 
-    serialised = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    start_time = time.time()
+    logger.info(f"Starting admiral_detector v{PKG_VERSION}")
 
-    if(output_path == STDOUT_TARGET):
-        sys.stdout.write(serialised)
-        sys.stdout.flush()
-        return
+    for cfg_warn in global_opts.get("config_warnings", []):
+        logger.warning(cfg_warn)
+    for cfg_err in global_opts.get("config_errors", []):
+        logger.error(cfg_err)
 
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = destination.with_suffix(f"{destination.suffix}.tmp.{os.getpid()}")
-    temp_path.write_text(serialised, encoding="utf-8")
-    temp_path.replace(destination)
+    cache_file = global_opts.get("rdap_cache_file")
+    rdap_cache: Optional[RDAPCache] = None
+    if(cache_file):
+        rdap_cache = RDAPCache(
+            cache_file=cache_file,
+            ttl_seconds=global_opts["rdap_cache_ttl_seconds"],
+        )
+
+    results = []
+    total_unique_domains: Set[str] = set()
+
+    for target in targets:
+        for warn in target.warnings:
+            logger.warning(warn)
+
+        strategies_label = ", ".join(target.strategies)
+        logger.info(
+            f"Scanning: {target.url} [Strategies: {strategies_label}, Profile: {target.profile or 'none'}]"
+        )
+        target_result: Dict[str, Any] = {
+            "publisher": target.name,
+            "profile": target.profile,
+            "initial_url": target.url,
+            "strategies": target.strategies,
+            "date_detected": datetime.datetime.now().isoformat(),
+            "network": {
+                "initial_url": target.url,
+                "final_url": None,
+                "redirect_chain": [],
+                "http_status": None,
+                "response_time_ms": None,
+                "proxy_used": target.proxy,
+                "dns_used": target.dns,
+                "tls_verified": not target.allow_insecure,
+                "headers_sent": target.headers,
+            },
+            "extracted_domains": [],
+            "rdap_rejected_domains": [],
+            "ignored_domains": [],
+            "error": None,
+        }
+
+        try:
+            with use_dns(target.dns), create_http_client(
+                timeout_seconds=target.timeout_seconds,
+                max_redirects=target.max_redirects,
+                proxy=target.proxy,
+                verify_ssl=not target.allow_insecure,
+            ) as client:
+                resp = client.get(target.url, headers=target.headers)
+                html_body = resp.text
+                final_url = str(resp.url)
+                all_urls = [str(r.url) for r in resp.history] + [final_url]
+                redirect_chain = all_urls[1:]
+
+                target_result["network"].update(
+                    {
+                        "final_url": final_url,
+                        "redirect_chain": redirect_chain,
+                        "http_status": resp.status_code,
+                        "response_time_ms": int(resp.elapsed.total_seconds() * 1000),
+                    }
+                )
+
+                logger.debug(
+                    f"HTTP {resp.status_code} received from final URL: {final_url} "
+                    f"(redirects: {len(redirect_chain)})"
+                )
+
+                merged_extractions: Dict[str, Dict[str, Any]] = {}
+                for strategy_name in target.strategies:
+                    strategy = get_strategy(strategy_name)
+                    extractions = strategy.extract(html_body, final_url)
+                    for domain, snippet in sorted(extractions):
+                        if(domain not in merged_extractions):
+                            merged_extractions[domain] = {
+                                "snippet": snippet,
+                                "matched_strategies": [strategy_name],
+                            }
+                        elif(strategy_name not in merged_extractions[domain]["matched_strategies"]):
+                            merged_extractions[domain]["matched_strategies"].append(strategy_name)
+
+                for domain in sorted(merged_extractions.keys()):
+                    entry_info = merged_extractions[domain]
+                    snippet = entry_info["snippet"]
+                    matched_strategies = entry_info["matched_strategies"]
+
+                    if(is_ignored(domain, target.ignore_domains, target.ignore_regexes)):
+                        logger.debug(f"Ignored: {domain} (matched ignore list)")
+                        target_result["ignored_domains"].append(domain)
+                        continue
+
+                    if(target.verify_rdap):
+                        active_cache = rdap_cache if(rdap_cache is not None) else _EphemeralRDAPCache()
+                        is_admiral, rdap_details = verify_domain_rdap(
+                            domain=domain,
+                            cache=active_cache,
+                            rdap_domain=target.rdap_domain,
+                            timeout=target.timeout_seconds,
+                            max_redirects=target.max_redirects,
+                            proxy=target.proxy,
+                            dns=target.dns,
+                        )
+                        if(is_admiral):
+                            total_unique_domains.add(domain)
+                            logger.info(f"Detected [RDAP Verified]: {domain}")
+                            logger.debug(f"Context: {snippet}")
+                            target_result["extracted_domains"].append(
+                                {
+                                    "domain": domain,
+                                    "matched_strategies": matched_strategies,
+                                    "context_snippet": snippet,
+                                    "rdap_verified": True,
+                                    "rdap_details": rdap_details,
+                                }
+                            )
+                        else:
+                            logger.debug(f"RDAP Rejected: {domain}")
+                            target_result["rdap_rejected_domains"].append(
+                                {
+                                    "domain": domain,
+                                    "matched_strategies": matched_strategies,
+                                    "context_snippet": snippet,
+                                    "rdap_verified": False,
+                                    "rdap_details": rdap_details,
+                                }
+                            )
+                    else:
+                        total_unique_domains.add(domain)
+                        logger.info(f"Detected: {domain}")
+                        logger.debug(f"Context: {snippet}")
+                        target_result["extracted_domains"].append(
+                            {
+                                "domain": domain,
+                                "matched_strategies": matched_strategies,
+                                "context_snippet": snippet,
+                                "rdap_verified": None,
+                                "rdap_details": None,
+                            }
+                        )
+
+        except Exception as error:
+            logger.error(f"Error fetching {target.url}: {error}")
+            target_result["error"] = str(error)
+
+        results.append(target_result)
+
+    duration = time.time() - start_time
+    return {
+        "metadata": {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "version": PKG_VERSION,
+            "duration_seconds": round(duration, 2),
+            "total_publishers_scanned": len(targets),
+            "unique_domains": sorted(list(total_unique_domains)),
+        },
+        "results": results,
+    }
 
 
-def _run_post_hooks(post_script_dir: Path | None, output_path: str) -> None:
-    """Execute executable hook scripts in post_script_dir sequentially."""
+class _EphemeralRDAPCache(RDAPCache):
+    """In-memory no-op RDAP cache used when --no-cache is specified."""
 
-    if(post_script_dir is None or not post_script_dir.is_dir()):
-        return
+    def __init__(self):
+        self.ttl_seconds = 0
+        self.cache_file = ""
+        self.cache = {}
 
-    logger = logging.getLogger("admiral_detector.hooks")
+    def get(self, domain: str) -> None:
+        return None
 
-    for script in sorted(post_script_dir.iterdir()):
-        if(not script.is_file() or not os.access(script, os.X_OK)):
-            continue
-
-        logger.info("Executing post-scan hook: %s", script)
-        env = os.environ.copy()
-        env["ADMIRAL_OUTPUT_FILE"] = output_path
-        subprocess.run([str(script)], env=env, check=True)
-
-# endregion
-
-
-# region Pipeline Adapters
-
-def _list_registered_strategies() -> list[dict[str, str]]:
-    """Return available detection strategy metadata from the strategy package."""
-
-    # TODO: Wire directly to your strategy registry (e.g. admiral_detector.strategies.REGISTRY)
-    from admiral_detector import strategies
-
-    if(hasattr(strategies, "list_strategies")):
-        return strategies.list_strategies()
-
-    return [
-        {"name": "inline_script", "description": "Extracts Admiral domains from inline <script> blocks."},
-        {"name": "obfuscation", "description": "Decodes obfuscated/encoded Admiral bootstrap payloads."},
-        {"name": "external_script", "description": "Inspects external third-party script references."},
-        {"name": "heuristics", "description": "Matches structural anti-adblock domain heuristics."},
-    ]
-
-
-def _execute_pipeline(config: RuntimeConfig) -> dict[str, Any]:
-    """Invoke the core detection and RDAP verification pipeline."""
-
-    # TODO: Wire directly to your existing scanner entry point (e.g. admiral_detector.scanner.run_scan)
-    from admiral_detector import scanner
-
-    return scanner.run_scan(config)
+    def set(self, domain: str, is_admiral: bool, details: Dict[str, Any]) -> None:
+        return None
 
 # endregion
 
 
 # region Subcommand Handlers
 
-def _handle_scan(args: argparse.Namespace) -> int:
-    """Execute an interactive or ad-hoc scan."""
+def _resolve_cli_log_level(base_level: str, verbose: int, quiet: bool) -> str:
+    if(quiet):
+        return "ERROR"
+    if(verbose > 0):
+        return "DEBUG"
+    return base_level
 
+
+def _handle_scan(args: argparse.Namespace) -> int:
     cli_urls = [*(args.positional_urls or []), *(args.url or [])]
 
     try:
-        config = build_scan_config(
+        cli_strategies = parse_cli_strategies(args.strategy or [])
+        targets, global_opts = build_scan_targets_and_opts(
             explicit_config=args.config,
             cli_urls=cli_urls,
-            cli_strategies=args.strategy or [],
-            output_path=args.output,
-            no_rdap=args.no_rdap,
+            cli_strategies=cli_strategies,
+            profile=args.profile,
+            output_file=args.output,
+            verify_rdap=args.rdap,
             no_cache=args.no_cache,
             proxy=args.proxy,
+            dns_server=args.dns,
+            allow_insecure=args.allow_insecure,
             run_hooks=args.run_hooks,
         )
-    except (FileNotFoundError, PermissionError) as exc:
+    except (FileNotFoundError, PermissionError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    if(not config.urls):
+    if(not targets):
         print(
             "Error: No target URLs provided. Pass one or more URLs "
-            "(e.g. `admiral-detector scan https://example.com`) or specify `-c <config>`.",
+            "(e.g. `admiral-detector scan https://www.news.com.au`) or specify `-c <config>`.",
             file=sys.stderr,
         )
         return EXIT_USAGE
 
-    _configure_logging(config, verbosity=args.verbose, quiet=args.quiet, daemon_mode=False)
-    results = _execute_pipeline(config)
-    _write_results(results, config.output_path)
+    log_level = _resolve_cli_log_level(global_opts["log_level"], args.verbose, args.quiet)
+    logger = setup_logger(log_level, global_opts["log_file"], stream=sys.stderr)
 
-    if(config.run_hooks):
-        _run_post_hooks(config.post_script_dir, config.output_path)
+    json_payload = run_detection_pipeline(targets, global_opts, logger)
+
+    if(global_opts["output_file"]):
+        write_json_output(json_payload, global_opts["output_file"])
+    if(args.run_hooks and global_opts["post_script_dir"]):
+        run_post_scripts(global_opts["post_script_dir"], global_opts["output_file"])
 
     return EXIT_SUCCESS
 
 
 def _handle_daemon(args: argparse.Namespace) -> int:
-    """Execute a production scheduled scan for systemd."""
-
     try:
-        config = load_ini_config(Path(args.config).expanduser(), daemon_mode=True)
+        targets, global_opts = load_config(args.config)
     except (FileNotFoundError, PermissionError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
     if(args.dry_run):
-        config.output_path = STDOUT_TARGET
-        config.run_hooks = False
+        global_opts["output_file"] = STDOUT_TARGET
+        global_opts["post_script_dir"] = None
+        global_opts["log_file"] = None
 
-    _configure_logging(config, verbosity=0, quiet=False, daemon_mode=not args.dry_run)
-    results = _execute_pipeline(config)
-    _write_results(results, config.output_path)
+    logger = setup_logger(global_opts["log_level"], global_opts["log_file"], stream=sys.stderr)
+    json_payload = run_detection_pipeline(targets, global_opts, logger)
 
-    if(config.run_hooks and not args.dry_run):
-        _run_post_hooks(config.post_script_dir, config.output_path)
+    if(global_opts["output_file"]):
+        write_json_output(json_payload, global_opts["output_file"])
+    if(global_opts["post_script_dir"] and not args.dry_run):
+        run_post_scripts(global_opts["post_script_dir"], global_opts["output_file"])
 
     return EXIT_SUCCESS
 
 
 def _handle_strategies(args: argparse.Namespace) -> int:
-    """Print available detection strategies."""
-
-    items = _list_registered_strategies()
+    items = [
+        {"name": name, "description": desc}
+        for name, desc in STRATEGY_DESCRIPTIONS.items()
+    ]
 
     if(args.json):
         print(json.dumps(items, indent=2))
         return EXIT_SUCCESS
 
     for item in items:
-        print(f"{item['name']:<18} {item['description']}")
+        print(f"{item['name']:<20} {item['description']}")
 
     return EXIT_SUCCESS
 
 
 def _handle_check_config(args: argparse.Namespace) -> int:
-    """Validate an INI configuration file and exit non-zero on error."""
+    target_path = args.config or SYSTEM_CONFIG_PATH
+    errors, warnings = validate_config_file(target_path)
 
-    target = Path(args.config).expanduser() if(args.config) else SYSTEM_CONFIG_PATH
-    errors = validate_config_file(target)
+    for warn in warnings:
+        print(f"Warning: {warn}", file=sys.stderr)
 
     if(errors):
-        print(f"Configuration invalid ({target}):", file=sys.stderr)
-        for error in errors:
-            print(f"  - {error}", file=sys.stderr)
+        print(f"Configuration invalid ({target_path}):", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
         return EXIT_ERROR
 
-    print(f"Configuration OK: {target}")
+    targets, _ = load_config(target_path)
+    print(f"Configuration OK: {target_path} ({len(targets)} target(s) configured)")
     return EXIT_SUCCESS
 
 # endregion
@@ -221,25 +361,29 @@ def _handle_check_config(args: argparse.Namespace) -> int:
 
 # region Argument Parser
 
-def _normalise_argv(argv: list[str]) -> list[str]:
+def _normalise_argv(argv: List[str]) -> List[str]:
     """Default bare invocations with URLs or scan flags to the `scan` subcommand."""
 
     if(not argv):
         return ["scan"]
 
     first = argv[0]
-    if(first in KNOWN_SUBCOMMANDS or first in HELP_FLAGS):
+    if(first in KNOWN_SUBCOMMANDS or first in PASSTHROUGH_FLAGS):
         return argv
 
     return ["scan", *argv]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Construct the top-level subcommand parser."""
-
     parser = argparse.ArgumentParser(
         prog="admiral-detector",
-        description="Detect and verify Admiral anti-adblock domains.",
+        description="Admiral/Leven Labs Proactive Domain Detector",
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"admiral_detector {PKG_VERSION}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -248,14 +392,17 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("positional_urls", nargs="*", metavar="URL", help="Target publisher URL(s).")
     scan_parser.add_argument("-u", "--url", action="append", help="Target publisher URL (repeatable).")
     scan_parser.add_argument("-c", "--config", help="Load baseline settings from an INI config file.")
-    scan_parser.add_argument("-s", "--strategy", action="append", help="Run specific strategy only (repeatable).")
+    scan_parser.add_argument("-s", "--strategy", action="append", help="Strategy name(s) (repeatable or CSV).")
+    scan_parser.add_argument("-p", "--profile", help="Named [profile:<name>] from --config to apply.")
     scan_parser.add_argument("-o", "--output", help="Write JSON to PATH instead of stdout ('-').")
-    scan_parser.add_argument("--no-rdap", action="store_true", help="Skip RDAP registration lookups.")
-    scan_parser.add_argument("--no-cache", action="store_true", help="Do not read or write the RDAP cache.")
-    scan_parser.add_argument("--proxy", help="HTTP/HTTPS proxy URL for this scan.")
-    scan_parser.add_argument("--run-hooks", action="store_true", help="Execute post.d hooks after scanning.")
-    scan_parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable debug logging on stderr.")
-    scan_parser.add_argument("-q", "--quiet", action="store_true", help="Only emit errors on stderr.")
+    scan_parser.add_argument("--rdap", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable RDAP verification.")
+    scan_parser.add_argument("--no-cache", action="store_true", help="Bypass reading/writing the RDAP cache.")
+    scan_parser.add_argument("--proxy", help="HTTP/SOCKS proxy URL for this scan.")
+    scan_parser.add_argument("--dns", help="Custom DNS resolver IP (e.g. 1.1.1.1) for this scan.")
+    scan_parser.add_argument("--allow-insecure", action="store_true", help="Permit http:// and disable TLS verification.")
+    scan_parser.add_argument("--run-hooks", action="store_true", help="Execute post_script_dir hooks after scanning.")
+    scan_parser.add_argument("-v", "--verbose", action="count", default=0, help="Enable DEBUG logging on stderr.")
+    scan_parser.add_argument("-q", "--quiet", action="store_true", help="Only emit ERROR logs on stderr.")
     scan_parser.set_defaults(func=_handle_scan)
 
     # daemon
@@ -277,7 +424,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     raw_argv = sys.argv[1:] if(argv is None) else argv
     parser = build_parser()
     args = parser.parse_args(_normalise_argv(raw_argv))

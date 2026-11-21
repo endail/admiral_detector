@@ -2,16 +2,29 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from typing import Any, Dict
+
+from .config import STDOUT_TARGET
 
 logger = logging.getLogger("AdmiralDetector")
 
 
 def write_json_output(data: Dict[str, Any], filepath: str) -> None:
+    serialised = json.dumps(data, indent=2) + "\n"
+
+    if(filepath == STDOUT_TARGET):
+        sys.stdout.write(serialised)
+        sys.stdout.flush()
+        return
+
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        abs_path = os.path.abspath(filepath)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        temp_path = f"{abs_path}.tmp.{os.getpid()}"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(serialised)
+        os.replace(temp_path, abs_path)
         logger.info(f"Wrote JSON payload to {filepath}")
     except Exception as e:
         logger.error(f"Failed to write JSON output to {filepath}: {e}")
@@ -20,6 +33,10 @@ def write_json_output(data: Dict[str, Any], filepath: str) -> None:
 def run_post_scripts(script_dir: str, payload_path: str) -> None:
     if(not script_dir or not os.path.exists(script_dir)):
         logger.info("No post-script directory configured or found. Skipping.")
+        return
+
+    if(not payload_path or payload_path == STDOUT_TARGET):
+        logger.warning("Skipping post-scripts because output_file is set to stdout.")
         return
 
     logger.info(f"Scanning for executable post-scripts in: {script_dir}")

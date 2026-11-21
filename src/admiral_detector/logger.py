@@ -1,10 +1,14 @@
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Optional, TextIO
 
 
-def setup_logger(level_name: str, log_file: Optional[str] = None) -> logging.Logger:
+def setup_logger(
+    level_name: str,
+    log_file: Optional[str] = None,
+    stream: TextIO = sys.stderr,
+) -> logging.Logger:
     level = getattr(logging, level_name.upper(), logging.INFO)
 
     logger = logging.getLogger("AdmiralDetector")
@@ -16,7 +20,7 @@ def setup_logger(level_name: str, log_file: Optional[str] = None) -> logging.Log
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    ch = logging.StreamHandler(sys.stdout)
+    ch = logging.StreamHandler(stream)
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
