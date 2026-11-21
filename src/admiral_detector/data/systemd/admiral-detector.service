@@ -7,10 +7,12 @@ Wants=network-online.target
 Type=oneshot
 User=admiral
 Group=admiral
-RuntimeDirectory=admiral_detector
-RuntimeDirectoryMode=0750
-ExecStart=/usr/local/bin/admiral-detector -c /etc/admiral_detector/admiral_detector.conf
-NoNewPrivileges=yes
+ExecStart=/usr/local/bin/admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/run/admiral_detector /var/lib/admiral_detector /var/log/admiral_detector
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/admiral_detector /var/log/admiral_detector
+
+[Install]
+WantedBy=multi-user.target
