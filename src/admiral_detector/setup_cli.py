@@ -57,6 +57,11 @@ DEFAULT_CONFIG_TEMPLATE = f"""[general]
 output_file = {DEFAULT_OUTPUT_FILE}
 post_script_dir = {POST_SCRIPT_DIR}/
 
+[daemon]
+interval = 1h
+random_delay = 5m
+initial_delay = 0s
+
 [rdap]
 verify = true
 cache_file = {STATE_DIR}/rdap_cache.json
@@ -226,15 +231,19 @@ def setup_core_detector(source_bin: str) -> None:
     else:
         print(f"Existing configuration preserved: {CONFIG_FILE}")
 
-    for unit_name in (DETECTOR_SERVICE_UNIT, DETECTOR_TIMER_UNIT):
-        unit_bytes = read_packaged_asset(f"data/systemd/{unit_name}")
-        dest_path = f"{SYSTEMD_DIR}/{unit_name}"
-        write_file_atomic(dest_path, unit_bytes, 0, 0, FILE_MODE_UNIT)
-        print(f"Installed {dest_path}")
+    # Remove legacy timer if previously installed
+    subprocess.run(["systemctl", "disable", "--now", DETECTOR_TIMER_UNIT], check=False, stderr=subprocess.DEVNULL)
+    if(remove_file_if_exists(f"{SYSTEMD_DIR}/{DETECTOR_TIMER_UNIT}")):
+        print(f"Removed legacy {DETECTOR_TIMER_UNIT}")
+
+    unit_bytes = read_packaged_asset(f"data/systemd/{DETECTOR_SERVICE_UNIT}")
+    dest_path = f"{SYSTEMD_DIR}/{DETECTOR_SERVICE_UNIT}"
+    write_file_atomic(dest_path, unit_bytes, 0, 0, FILE_MODE_UNIT)
+    print(f"Installed {dest_path}")
 
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", "--now", DETECTOR_TIMER_UNIT], check=True)
-    print(f"Enabled and started {DETECTOR_TIMER_UNIT}.")
+    subprocess.run(["systemctl", "enable", "--now", DETECTOR_SERVICE_UNIT], check=True)
+    print(f"Enabled and started {DETECTOR_SERVICE_UNIT}.")
 #endregion
 
 
@@ -336,10 +345,12 @@ def uninstall_pihole_sync() -> None:
 def uninstall_core_detector(purge: bool) -> None:
 
     print("\n--- Removing Core Detector Service ---")
-    subprocess.run(["systemctl", "disable", "--now", DETECTOR_TIMER_UNIT], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "disable", "--now", DETECTOR_SERVICE_UNIT], check=False, stderr=subprocess.DEVNULL)
     subprocess.run(["systemctl", "stop", DETECTOR_SERVICE_UNIT], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "disable", "--now", DETECTOR_TIMER_UNIT], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "stop", DETECTOR_TIMER_UNIT], check=False, stderr=subprocess.DEVNULL)
 
-    for unit_name in (DETECTOR_TIMER_UNIT, DETECTOR_SERVICE_UNIT):
+    for unit_name in (DETECTOR_SERVICE_UNIT, DETECTOR_TIMER_UNIT):
         dest_path = f"{SYSTEMD_DIR}/{unit_name}"
         if(remove_file_if_exists(dest_path)):
             print(f"Removed {dest_path}")
@@ -489,8 +500,8 @@ def main() -> None:
         print("\nSkipping Pi-hole sync integration (run 'sudo admiral-detector-setup --pihole-sync-only' later to enable).")
 
     if(run_now):
-        print("\n--- Running Initial Detection Scan ---")
-        subprocess.run(["systemctl", "start", DETECTOR_SERVICE_UNIT], check=True)
+        print("\n--- Triggering Initial Detection Scan ---")
+        subprocess.run(["systemctl", "restart", DETECTOR_SERVICE_UNIT], check=True)
         subprocess.run(["journalctl", "-u", DETECTOR_SERVICE_UNIT, "-n", "25", "--no-pager"], check=True)
 
     print("\nSetup complete.")

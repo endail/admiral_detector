@@ -1,6 +1,9 @@
 [general]
 output_file = /run/admiral_detector/detected_domains.json
 
+[daemon]
+interval = 1h
+
 [publishers]
 techcrunch.com
 https://www.geelongadvertiser.com.au/nocookies?a=A.flavipes

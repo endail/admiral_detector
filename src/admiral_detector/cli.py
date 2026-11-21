@@ -2,13 +2,20 @@ import argparse
 import datetime
 import json
 import logging
+import os
+import random
 import re
+import signal
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set
 
 from . import __version__ as FALLBACK_VERSION
 from .config import (
+    DEFAULT_DAEMON_INITIAL_DELAY,
+    DEFAULT_DAEMON_INTERVAL,
+    DEFAULT_DAEMON_RANDOM_DELAY,
     STDOUT_TARGET,
     STRATEGY_DESCRIPTIONS,
     SYSTEM_CONFIG_PATH,
@@ -16,6 +23,7 @@ from .config import (
     build_scan_targets_and_opts,
     load_config,
     parse_cli_strategies,
+    parse_duration,
     validate_config_file,
 )
 from .logger import setup_logger
@@ -300,27 +308,183 @@ def _handle_scan(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
-def _handle_daemon(args: argparse.Namespace) -> int:
+def _run_daemon_iteration(
+    targets: List[TargetSite],
+    global_opts: Dict[str, Any],
+    logger: logging.Logger,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    json_payload = run_detection_pipeline(targets, global_opts, logger)
+    if(global_opts.get("output_file")):
+        write_json_output(json_payload, global_opts["output_file"])
+    if(global_opts.get("post_script_dir") and not dry_run):
+        run_post_scripts(global_opts["post_script_dir"], global_opts["output_file"])
+    return json_payload
+
+
+def _run_daemon_loop(
+    config_path: str,
+    initial_targets: List[TargetSite],
+    initial_opts: Dict[str, Any],
+    cli_interval_override: Optional[str] = None,
+) -> int:
+    targets = initial_targets
+    global_opts = initial_opts
+
+    wake_event = threading.Event()
+    shutdown_flag = False
+    reload_flag = False
+
+    def _sig_handler_shutdown(signum, frame):
+        nonlocal shutdown_flag
+        shutdown_flag = True
+        wake_event.set()
+
+    def _sig_handler_reload(signum, frame):
+        nonlocal reload_flag
+        reload_flag = True
+        wake_event.set()
+
+    old_sigterm = signal.signal(signal.SIGTERM, _sig_handler_shutdown)
+    old_sigint = signal.signal(signal.SIGINT, _sig_handler_shutdown)
+    old_sighup = None
+    if(hasattr(signal, "SIGHUP")):
+        old_sighup = signal.signal(signal.SIGHUP, _sig_handler_reload)
+
+    logger = setup_logger(global_opts["log_level"], global_opts["log_file"], stream=sys.stderr)
+    logger.info(f"Admiral Detector daemon started (PID {os.getpid()})")
+
     try:
-        targets, global_opts = load_config(args.config)
+        last_mtime = os.path.getmtime(config_path)
+    except OSError:
+        last_mtime = 0.0
+
+    initial_delay = global_opts.get("daemon_initial_delay", DEFAULT_DAEMON_INITIAL_DELAY)
+    if(initial_delay > 0):
+        logger.info(f"Initial delay configured: waiting {initial_delay}s before first scan...")
+        wake_event.wait(timeout=initial_delay)
+        if(shutdown_flag):
+            logger.info("Shutdown signal received during initial delay. Exiting daemon.")
+            return EXIT_SUCCESS
+        wake_event.clear()
+
+    try:
+        while(not shutdown_flag):
+            should_reload = reload_flag
+            if(not should_reload):
+                try:
+                    curr_mtime = os.path.getmtime(config_path)
+                    if(curr_mtime > last_mtime):
+                        should_reload = True
+                        last_mtime = curr_mtime
+                        logger.info(f"Detected configuration file change on disk: {config_path}")
+                except OSError:
+                    pass
+
+            if(should_reload):
+                reload_flag = False
+                logger.info(f"Reloading configuration from {config_path}...")
+                try:
+                    reloaded_targets, reloaded_opts = load_config(config_path)
+                    if(reloaded_opts.get("config_errors")):
+                        for err in reloaded_opts["config_errors"]:
+                            logger.error(f"Configuration reload error: {err}")
+                        logger.warning("Retaining existing configuration due to errors in updated config.")
+                    elif(not reloaded_targets):
+                        logger.error("Configuration reload found no target URLs; retaining existing configuration.")
+                    else:
+                        targets = reloaded_targets
+                        global_opts = reloaded_opts
+                        if(cli_interval_override):
+                            global_opts["daemon_interval"] = parse_duration(cli_interval_override)
+                        logger = setup_logger(global_opts["log_level"], global_opts["log_file"], stream=sys.stderr)
+                        try:
+                            last_mtime = os.path.getmtime(config_path)
+                        except OSError:
+                            pass
+                        logger.info("Configuration successfully reloaded.")
+                except Exception as exc:
+                    logger.error(f"Failed to reload configuration: {exc}. Retaining existing configuration.")
+
+            cycle_start = time.time()
+            logger.info(f"Starting daemon scan iteration ({len(targets)} target(s) configured)...")
+
+            try:
+                _run_daemon_iteration(targets, global_opts, logger, dry_run=False)
+            except Exception as exc:
+                logger.error(f"Unhandled error in detection cycle: {exc}", exc_info=True)
+
+            if(shutdown_flag):
+                break
+
+            cycle_duration = time.time() - cycle_start
+            interval = global_opts.get("daemon_interval", DEFAULT_DAEMON_INTERVAL)
+            random_delay = global_opts.get("daemon_random_delay", DEFAULT_DAEMON_RANDOM_DELAY)
+            jitter = random.uniform(0, random_delay) if(random_delay > 0) else 0.0
+
+            sleep_seconds = max(0.0, (interval - cycle_duration)) + jitter
+            next_run_dt = datetime.datetime.now() + datetime.timedelta(seconds=sleep_seconds)
+
+            jitter_str = f" (including {round(jitter, 1)}s jitter)" if(jitter > 0) else ""
+            logger.info(
+                f"Scan iteration finished in {round(cycle_duration, 2)}s. "
+                f"Next scan scheduled in {round(sleep_seconds, 1)}s{jitter_str} at "
+                f"{next_run_dt.strftime('%Y-%m-%d %H:%M:%S')}."
+            )
+
+            wake_event.wait(timeout=sleep_seconds)
+            if(shutdown_flag):
+                break
+            if(reload_flag):
+                wake_event.clear()
+                logger.info("SIGHUP received: waking immediately for reload and next scan iteration.")
+                continue
+            wake_event.clear()
+
+        logger.info("Daemon received shutdown signal. Terminating cleanly.")
+        return EXIT_SUCCESS
+
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        if(old_sighup is not None and hasattr(signal, "SIGHUP")):
+            signal.signal(signal.SIGHUP, old_sighup)
+
+
+def _handle_daemon(args: argparse.Namespace) -> int:
+    config_path = os.path.abspath(os.path.expanduser(args.config))
+    if(not os.path.isfile(config_path)):
+        print(f"Error: Config file missing: {config_path}", file=sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        targets, global_opts = load_config(config_path)
     except (FileNotFoundError, PermissionError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    if(args.dry_run):
-        global_opts["output_file"] = STDOUT_TARGET
-        global_opts["post_script_dir"] = None
-        global_opts["log_file"] = None
+    if(args.interval):
+        try:
+            parsed_interval = parse_duration(args.interval)
+            if(parsed_interval <= 0):
+                print("Error: --interval must be greater than 0 seconds.", file=sys.stderr)
+                return EXIT_USAGE
+            global_opts["daemon_interval"] = parsed_interval
+        except ValueError as exc:
+            print(f"Error: Invalid --interval: {exc}", file=sys.stderr)
+            return EXIT_USAGE
 
-    logger = setup_logger(global_opts["log_level"], global_opts["log_file"], stream=sys.stderr)
-    json_payload = run_detection_pipeline(targets, global_opts, logger)
+    if(args.dry_run or args.once):
+        if(args.dry_run):
+            global_opts["output_file"] = STDOUT_TARGET
+            global_opts["post_script_dir"] = None
+            global_opts["log_file"] = None
 
-    if(global_opts["output_file"]):
-        write_json_output(json_payload, global_opts["output_file"])
-    if(global_opts["post_script_dir"] and not args.dry_run):
-        run_post_scripts(global_opts["post_script_dir"], global_opts["output_file"])
+        logger = setup_logger(global_opts["log_level"], global_opts["log_file"], stream=sys.stderr)
+        _run_daemon_iteration(targets, global_opts, logger, dry_run=args.dry_run)
+        return EXIT_SUCCESS
 
-    return EXIT_SUCCESS
+    return _run_daemon_loop(config_path, targets, global_opts, args.interval)
 
 
 def _handle_strategies(args: argparse.Namespace) -> int:
@@ -406,9 +570,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.set_defaults(func=_handle_scan)
 
     # daemon
-    daemon_parser = subparsers.add_parser("daemon", help="Run the production systemd scan workflow.")
+    daemon_parser = subparsers.add_parser("daemon", help="Run the continuous production daemon scan workflow.")
     daemon_parser.add_argument("-c", "--config", required=True, help="Path to production INI config file.")
-    daemon_parser.add_argument("--dry-run", action="store_true", help="Print JSON to stdout without writing files or hooks.")
+    daemon_parser.add_argument("--interval", help="Override configured daemon scan interval (e.g. 1h, 30m, 3600).")
+    daemon_parser.add_argument("--once", action="store_true", help="Run a single scan iteration and exit.")
+    daemon_parser.add_argument("--dry-run", action="store_true", help="Print JSON to stdout without writing files or hooks (runs once).")
     daemon_parser.set_defaults(func=_handle_daemon)
 
     # strategies

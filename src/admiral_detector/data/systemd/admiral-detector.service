@@ -4,10 +4,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=admiral
 Group=admiral
 ExecStart=/usr/local/bin/admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

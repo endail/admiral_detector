@@ -2,6 +2,14 @@
 output_file = /run/admiral_detector/detected_domains.json
 post_script_dir = /etc/admiral_detector/post.d/
 
+[daemon]
+# How often the daemon runs detection scans (e.g. 1h, 30m, 3600s)
+interval = 1h
+# Maximum randomized jitter added to interval to vary scan times (e.g. 5m, 300s, 0s to disable)
+random_delay = 5m
+# Delay before the first scan iteration on daemon startup (e.g. 0s, 3min)
+initial_delay = 0s
+
 [defaults]
 strategy = inline_script
 ignore_domains = forms.gle, pubimgs.net, regex:\.google\.com$

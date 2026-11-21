@@ -19,6 +19,9 @@ DEFAULT_RDAP_CACHE_TTL = 60 * 60 * 24 * 30
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_MAX_REDIRECTS = 5
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_DAEMON_INTERVAL = 3600
+DEFAULT_DAEMON_RANDOM_DELAY = 0
+DEFAULT_DAEMON_INITIAL_DELAY = 0
 
 SYSTEM_CONFIG_PATH = "/etc/admiral_detector/admiral_detector.conf"
 USER_CONFIG_PATH = os.path.expanduser("~/.config/admiral_detector/admiral_detector.conf")
@@ -42,6 +45,35 @@ REGEX_PREFIX = "regex:"
 HEADER_PREFIX = "header_"
 PUBLISHER_SECTION_PREFIX = "publisher:"
 PROFILE_SECTION_PREFIX = "profile:"
+
+DURATION_REGEX = re.compile(
+    r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?",
+    re.IGNORECASE,
+)
+
+DURATION_MULTIPLIERS: Dict[str, float] = {
+    "s": 1.0,
+    "sec": 1.0,
+    "secs": 1.0,
+    "second": 1.0,
+    "seconds": 1.0,
+    "m": 60.0,
+    "min": 60.0,
+    "mins": 60.0,
+    "minute": 60.0,
+    "minutes": 60.0,
+    "h": 3600.0,
+    "hr": 3600.0,
+    "hrs": 3600.0,
+    "hour": 3600.0,
+    "hours": 3600.0,
+    "d": 86400.0,
+    "day": 86400.0,
+    "days": 86400.0,
+    "w": 604800.0,
+    "week": 604800.0,
+    "weeks": 604800.0,
+}
 
 # endregion
 
@@ -150,6 +182,56 @@ def parse_cli_strategies(raw_items: List[str]) -> List[str]:
                 parsed.append(cleaned)
 
     return parsed
+
+
+def parse_duration(raw_value: Any) -> int:
+    """Parse a human-readable duration string or integer into seconds."""
+
+    if(isinstance(raw_value, (int, float))):
+        if(raw_value < 0):
+            raise ValueError(f"Duration cannot be negative: {raw_value}")
+        return int(raw_value)
+
+    if(not isinstance(raw_value, str)):
+        raise ValueError(f"Expected duration string or number, got {type(raw_value).__name__}")
+
+    cleaned = raw_value.strip()
+    if(not cleaned):
+        raise ValueError("Empty duration string provided.")
+    if(cleaned.startswith("-")):
+        raise ValueError(f"Duration cannot be negative: '{cleaned}'")
+
+    try:
+        val = float(cleaned)
+        if(val < 0):
+            raise ValueError(f"Duration cannot be negative: '{cleaned}'")
+        return int(val)
+    except ValueError:
+        pass
+
+    matches = list(DURATION_REGEX.finditer(cleaned))
+    if(not matches):
+        raise ValueError(f"Invalid duration format: '{cleaned}'")
+
+    total_seconds = 0.0
+    last_end = 0
+    for match in matches:
+        gap = cleaned[last_end:match.start()].strip(" ,")
+        if(gap):
+            raise ValueError(f"Invalid duration format: '{cleaned}' (unexpected '{gap}')")
+        amount_str, unit_str = match.groups()
+        amount = float(amount_str)
+        unit = (unit_str or "s").lower()
+        if(unit not in DURATION_MULTIPLIERS):
+            raise ValueError(f"Unknown duration unit '{unit}' in '{cleaned}'")
+        total_seconds += amount * DURATION_MULTIPLIERS[unit]
+        last_end = match.end()
+
+    trailing = cleaned[last_end:].strip(" ,")
+    if(trailing):
+        raise ValueError(f"Invalid duration format: '{cleaned}' (unexpected '{trailing}')")
+
+    return int(total_seconds)
 
 
 def _parse_ignore_list(raw_string: str) -> Tuple[Set[str], List[re.Pattern], List[str]]:
@@ -270,6 +352,81 @@ def load_config(config_path: str) -> Tuple[List[TargetSite], Dict[str, Any]]:
             if(k.lower().startswith(HEADER_PREFIX) and v is not None):
                 _set_header(default_headers, k[len(HEADER_PREFIX):], v)
 
+    def _get_first_option(
+        cfg: configparser.ConfigParser,
+        sections: Tuple[str, ...],
+        keys: Tuple[str, ...],
+    ) -> Optional[str]:
+        for sec in sections:
+            if(cfg.has_section(sec)):
+                for k in keys:
+                    if(cfg.has_option(sec, k)):
+                        val = cfg.get(sec, k)
+                        if(val is not None and val.strip()):
+                            return val.strip()
+        return None
+
+    raw_interval = _get_first_option(
+        config,
+        ("daemon", "timer", "general"),
+        ("interval", "interval_seconds", "interval_sec", "scan_interval", "on_unit_active_sec"),
+    )
+    raw_random_delay = _get_first_option(
+        config,
+        ("daemon", "timer", "general"),
+        (
+            "random_delay",
+            "random_delay_seconds",
+            "random_delay_sec",
+            "randomized_delay",
+            "randomized_delay_sec",
+            "jitter",
+        ),
+    )
+    raw_initial_delay = _get_first_option(
+        config,
+        ("daemon", "timer", "general"),
+        (
+            "initial_delay",
+            "initial_delay_seconds",
+            "initial_delay_sec",
+            "start_delay",
+            "on_boot_sec",
+        ),
+    )
+
+    daemon_interval = DEFAULT_DAEMON_INTERVAL
+    if(raw_interval is not None):
+        try:
+            parsed_interval = parse_duration(raw_interval)
+            if(parsed_interval <= 0):
+                config_errors.append(
+                    f"Daemon interval must be greater than 0 seconds (got '{raw_interval}')."
+                )
+            else:
+                daemon_interval = parsed_interval
+        except ValueError as exc:
+            config_errors.append(f"Invalid daemon interval: {exc}")
+
+    daemon_random_delay = DEFAULT_DAEMON_RANDOM_DELAY
+    if(raw_random_delay is not None):
+        try:
+            daemon_random_delay = parse_duration(raw_random_delay)
+        except ValueError as exc:
+            config_errors.append(f"Invalid daemon random_delay: {exc}")
+
+    daemon_initial_delay = DEFAULT_DAEMON_INITIAL_DELAY
+    if(raw_initial_delay is not None):
+        try:
+            daemon_initial_delay = parse_duration(raw_initial_delay)
+        except ValueError as exc:
+            config_errors.append(f"Invalid daemon initial_delay: {exc}")
+
+    if(daemon_random_delay >= daemon_interval):
+        config_warnings.append(
+            f"Daemon random_delay ({daemon_random_delay}s) is greater than or equal to interval ({daemon_interval}s)."
+        )
+
     global_opts: Dict[str, Any] = {
         "output_file": _normalise_optional_str(
             config.get("general", "output_file", fallback=DEFAULT_OUTPUT_FILE)
@@ -281,6 +438,9 @@ def load_config(config_path: str) -> Tuple[List[TargetSite], Dict[str, Any]]:
         "default_ignore_domains": default_ignore_domains,
         "default_ignore_regexes": default_ignore_regexes,
         "default_headers": default_headers,
+        "daemon_interval": daemon_interval,
+        "daemon_random_delay": daemon_random_delay,
+        "daemon_initial_delay": daemon_initial_delay,
         "verify_rdap": config.getboolean("rdap", "verify", fallback=False),
         "rdap_domain": config.get("rdap", "domain", fallback=DEFAULT_RDAP_DOMAIN).strip(),
         "rdap_cache_file": config.get("rdap", "cache_file", fallback=DEFAULT_RDAP_CACHE_FILE).strip(),
@@ -450,6 +610,9 @@ def _build_default_global_opts() -> Dict[str, Any]:
         "default_ignore_domains": set(),
         "default_ignore_regexes": [],
         "default_headers": default_headers,
+        "daemon_interval": DEFAULT_DAEMON_INTERVAL,
+        "daemon_random_delay": DEFAULT_DAEMON_RANDOM_DELAY,
+        "daemon_initial_delay": DEFAULT_DAEMON_INITIAL_DELAY,
         "verify_rdap": True,
         "rdap_domain": DEFAULT_RDAP_DOMAIN,
         "rdap_cache_file": USER_CACHE_PATH,

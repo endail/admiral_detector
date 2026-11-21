@@ -4,10 +4,10 @@
 
 ## Features
 
-* **Interactive & Daemon Subcommands:** Run stateless ad-hoc scans directly in your terminal (`admiral-detector scan`) or run scheduled production scans (`admiral-detector daemon`) without colliding with system file permissions or post-scan hooks.
+* **Interactive & Daemon Subcommands:** Run stateless ad-hoc scans directly in your terminal (`admiral-detector scan`) or run continuous production scans (`admiral-detector daemon`) with configurable scan intervals, randomized jitter, and startup delays controlled via the configuration file.
 * **Modular Detection Strategies:** Extracts candidate anti-adblock domains from inline scripts, obfuscated payloads, external script references, and structural heuristics.
 * **RDAP Verification & Caching:** Validates candidate domains against RDAP endpoints (such as `rdap.org` and registrar servers) with local JSON caching to avoid redundant lookups.
-* **Privilege-Separated `systemd` Service:** Runs scheduled scans under a dedicated, unprivileged `admiral` system account with hardened `systemd` unit restrictions.
+* **Privilege-Separated `systemd` Service:** Runs the continuous daemon service under a dedicated, unprivileged `admiral` system account with hardened `systemd` unit restrictions and dynamic SIGHUP configuration reload support.
 * **Zero-Rebuild Pi-hole Integration:** Stages newly discovered domains immediately into Pi-hole's wildcard denylist (`pihole reloadlists`) without triggering slow `pihole -g` gravity rebuilds, then automatically cleans up staged entries once weekly gravity runs ingest the local adlist.
 * **Packaged Setup CLI:** Includes `admiral-detector-setup` to provision, update, or cleanly remove `systemd` units and Pi-hole integration interactively or non-interactively.
 
@@ -46,8 +46,7 @@ admiral_detector/
         ├── strategies/
         └── data/
             ├── systemd/
-            │   ├── admiral-detector.service
-            │   └── admiral-detector.timer
+            │   └── admiral-detector.service
             └── integrations/
                 └── pihole/
                     ├── 99-update-admiral-adlist.sh
@@ -133,7 +132,7 @@ During setup, a system configuration file is created at `/etc/admiral_detector/a
 | Subcommand | Purpose |
 | :--- | :--- |
 | `admiral-detector scan` | Run an interactive or ad-hoc scan against URLs or a config file (outputs JSON to `stdout` by default). |
-| `admiral-detector daemon` | Run the production scheduled scan invoked by `admiral-detector.service`. |
+| `admiral-detector daemon` | Run the continuous production scan daemon invoked by `admiral-detector.service`. |
 | `admiral-detector strategies` | List all available detection strategy modules and their identifiers. |
 | `admiral-detector check-config` | Validate an INI configuration file, regex ignore rules, and directory permissions. |
 
@@ -173,19 +172,49 @@ Supported `scan` options:
 * `--run-hooks` — Opt-in flag to execute `post_script_dir` hooks after scanning (disabled by default in `scan`).
 * `-v, --verbose` / `-q, --quiet` — Increase (`DEBUG`) or reduce (`ERROR`) log verbosity on `stderr`.
 
-### Production & Dry-Run Execution (`daemon`)
+### Continuous Daemon & Timing Configuration (`daemon`)
 
-Test the production configuration safely as the `admiral` user without writing state files or triggering Pi-hole updates:
+In daemon mode, `admiral-detector` runs as a continuous background service whose timing cadence is configured directly in the INI configuration file under `[daemon]`:
+
+```ini
+[daemon]
+# Scan interval: e.g. 1h, 30m, 3600s
+interval = 1h
+
+# Randomized jitter delay added to interval: e.g. 5m, 300s, 0s to disable
+random_delay = 5m
+
+# Initial delay before the first scan iteration on startup: e.g. 0s, 3min
+initial_delay = 0s
+```
+
+Run the continuous daemon (used by `admiral-detector.service`):
+
+```bash
+admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf
+```
+
+Test a single iteration safely as the `admiral` user without writing state files or triggering Pi-hole hooks:
 
 ```bash
 sudo -u admiral admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf --dry-run
 ```
 
-Run the full production pipeline (used by `admiral-detector.service`):
+Run a single scan iteration with production file outputs and hooks without looping:
 
 ```bash
-admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf
+admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf --once
 ```
+
+Temporarily override the scan interval via CLI:
+
+```bash
+admiral-detector daemon -c /etc/admiral_detector/admiral_detector.conf --interval 30m
+```
+
+The daemon responds to:
+* **`SIGTERM` / `SIGINT`:** Gracefully finishes the current scan cycle or sleep and terminates cleanly (exit code 0).
+* **`SIGHUP` (or file modification):** Automatically detects modified configuration on disk or upon receiving `SIGHUP` (`systemctl reload admiral-detector.service`), immediately reloads configuration, and starts a fresh scan cycle.
 
 ### Inspecting Strategies & Validating Configs
 
@@ -196,7 +225,7 @@ admiral-detector strategies
 admiral-detector strategies --json
 ```
 
-Validate configuration syntax, ignore regexes, and path permissions before reloading the service:
+Validate configuration syntax, timing options, ignore regexes, and path permissions before reloading the service:
 
 ```bash
 admiral-detector check-config -c ~/admiral.conf
@@ -205,20 +234,25 @@ sudo admiral-detector check-config -c /etc/admiral_detector/admiral_detector.con
 
 ## Managing the `systemd` Service
 
-Check timer schedule and service status:
+Check service status:
 
 ```bash
-systemctl status admiral-detector.timer
 systemctl status admiral-detector.service
 ```
 
-Trigger an immediate scheduled scan via `systemd`:
+Restart the service:
 
 ```bash
-sudo systemctl start admiral-detector.service
+sudo systemctl restart admiral-detector.service
 ```
 
-View scan and Pi-hole sync logs:
+Reload configuration on the fly without stopping the daemon:
+
+```bash
+sudo systemctl reload admiral-detector.service
+```
+
+View daemon and Pi-hole sync logs:
 
 ```bash
 journalctl -u admiral-detector.service -n 50 --no-pager
