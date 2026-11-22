@@ -46,7 +46,14 @@ EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 
-KNOWN_SUBCOMMANDS = {"scan", "daemon", "strategies", "check-config"}
+KNOWN_SUBCOMMANDS = {
+    "scan",
+    "daemon",
+    "strategies",
+    "check-config",
+    "update-pihole-adlist",
+    "pihole-sync",
+}
 PASSTHROUGH_FLAGS = {"-h", "--help", "-V", "--version"}
 
 # endregion
@@ -520,6 +527,34 @@ def _handle_check_config(args: argparse.Namespace) -> int:
     print(f"Configuration OK: {target_path} ({len(targets)} target(s) configured)")
     return EXIT_SUCCESS
 
+
+def _handle_update_pihole_adlist(args: argparse.Namespace) -> int:
+    from .pihole.adlist import main as adlist_main
+
+    argv = []
+    if(args.payload):
+        argv.append(args.payload)
+    if(args.config):
+        argv.extend(["-c", args.config])
+    if(args.adlist):
+        argv.extend(["-o", args.adlist])
+
+    return adlist_main(argv)
+
+
+def _handle_pihole_sync(args: argparse.Namespace) -> int:
+    from .pihole.sync import main as sync_main
+
+    argv = []
+    if(args.config):
+        argv.extend(["-c", args.config])
+    if(args.dry_run):
+        argv.append("--dry-run")
+    if(args.verbose):
+        argv.append("-v")
+
+    return sync_main(argv)
+
 # endregion
 
 
@@ -586,6 +621,26 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser = subparsers.add_parser("check-config", help="Validate an INI configuration file.")
     check_parser.add_argument("-c", "--config", help=f"Config file path (default: {SYSTEM_CONFIG_PATH}).")
     check_parser.set_defaults(func=_handle_check_config)
+
+    # update-pihole-adlist
+    adlist_parser = subparsers.add_parser(
+        "update-pihole-adlist",
+        help="Ingest detector JSON payload and update Pi-hole adlist file.",
+    )
+    adlist_parser.add_argument("payload", nargs="?", help="Path to detected_domains.json output.")
+    adlist_parser.add_argument("-c", "--config", help="Path to pihole.conf.")
+    adlist_parser.add_argument("-o", "--adlist", help="Path to adlist output file.")
+    adlist_parser.set_defaults(func=_handle_update_pihole_adlist)
+
+    # pihole-sync
+    pihole_parser = subparsers.add_parser(
+        "pihole-sync",
+        help="Synchronise adlist and staged denylist with Pi-hole (local or remote API).",
+    )
+    pihole_parser.add_argument("-c", "--config", help="Path to pihole.conf.")
+    pihole_parser.add_argument("--dry-run", action="store_true", help="Report planned changes without applying.")
+    pihole_parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging.")
+    pihole_parser.set_defaults(func=_handle_pihole_sync)
 
     return parser
 

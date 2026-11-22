@@ -135,6 +135,8 @@ During setup, a system configuration file is created at `/etc/admiral_detector/a
 | `admiral-detector daemon` | Run the continuous production scan daemon invoked by `admiral-detector.service`. |
 | `admiral-detector strategies` | List all available detection strategy modules and their identifiers. |
 | `admiral-detector check-config` | Validate an INI configuration file, regex ignore rules, and directory permissions. |
+| `admiral-detector update-pihole-adlist` | Ingest detector JSON payload and update the local Pi-hole adlist file. |
+| `admiral-detector pihole-sync` | Synchronise adlist and staged denylist with Pi-hole (local or remote REST API). |
 
 *(Bare invocations whose first argument is a URL or scan flag automatically default to `admiral-detector scan`.)*
 
@@ -261,14 +263,21 @@ journalctl -u admiral-pihole-sync.service -n 50 --no-pager
 
 ## How Pi-hole Sync Works
 
-When Pi-hole integration is enabled, domain updates flow across two privilege boundaries:
+When Pi-hole integration is enabled, domain updates flow across two privilege boundaries with full integrity hashing and backend abstraction:
 
-1. **Detection (`admiral` user):** `admiral-detector.service` writes JSON results to `/run/admiral_detector/detected_domains.json` and runs `/etc/admiral_detector/post.d/99-update-admiral-adlist.sh`, which atomically updates `/var/lib/admiral_detector/admiral_domains.list`.
-2. **Path Activation (`root`):** `admiral-pihole-sync.path` monitors `/var/lib/admiral_detector/admiral_domains.list` via `inotify` and triggers `admiral-pihole-sync.service` (`/usr/local/sbin/admiral-pihole-sync`).
-3. **Hybrid Blocking:**
-   * `file:///var/lib/admiral_detector/admiral_domains.list` is registered as a Pi-hole adlist (`Admiral Detector domains`).
-   * Any domain not yet compiled into `gravity.db` is validated with `pihole-FTL gravity checkList`, added to the wildcard denylist (`pihole denylist --wild -q`) with the comment `Admiral Detector staged`, and activated immediately via `pihole reloadlists`.
-   * Once Pi-hole's scheduled weekly `pihole -g` run ingests the adlist into `gravity.db`, subsequent sync runs automatically remove the redundant staged denylist entries.
+1. **Detection (`admiral` user):** `admiral-detector.service` writes JSON results to `/run/admiral_detector/detected_domains.json` and invokes `/etc/admiral_detector/post.d/99-update-admiral-adlist.sh`, which calls `admiral-detector update-pihole-adlist` to atomically update `/var/lib/admiral_detector/admiral_domains.list`.
+2. **Path Activation (`root`):** `admiral-pihole-sync.path` monitors `/var/lib/admiral_detector/admiral_domains.list` via `inotify` and triggers `admiral-pihole-sync.service` (`/usr/local/sbin/admiral-pihole-sync` or `admiral-detector pihole-sync`).
+3. **Synchronization & Integrity-Checked Hybrid Blocking:**
+   * Configured via `/etc/admiral_detector/pihole.conf` (see [pihole.conf.example](pihole.conf.example)).
+   * **Local Backend:** Operates directly against local Pi-hole installations (bare-metal or Docker via `docker_container = pihole`), querying `gravity.db` with WAL busy timeouts and staging domains using official `pihole denylist --wild` CLI batches.
+   * **Remote API Backend:** Communicates directly with remote Pi-hole v6 instances over HTTPS via the official Pi-hole v6 REST API (`/api/domains`, `/api/lists`).
+   * **Integrity Hashing:** Staged denylist entries are labeled with a domain integrity hash:
+     ```text
+     admiral_detector:staged:<sha256(domain)[:16]>
+     ```
+     This binds each denylist entry cryptographically to its domain name, preventing accidental removal or collision with user-managed denylist rules.
+   * **Zero-Rebuild Instant Blocking:** Uncompiled domains are immediately activated in the wildcard denylist and loaded with `pihole reloadlists`. Once Pi-hole's weekly gravity run (`pihole -g`) compiles the local adlist into `gravity.db`, subsequent sync runs automatically unstage the redundant denylist entries.
+   * **Concurrency Protection:** Uses non-blocking `flock` locking (`/run/admiral_detector/pihole-sync.lock`) to prevent race conditions during rapid or manual CLI runs.
 
 ## Setup CLI Reference
 

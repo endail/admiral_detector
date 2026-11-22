@@ -1,0 +1,39 @@
+[pihole]
+# Synchronization mode: 'local' (local Pi-hole installation or Docker) or 'api' (remote Pi-hole v6 REST API)
+mode = local
+
+[local]
+# Path to Pi-hole's local gravity SQLite database
+gravity_db = /etc/pihole/gravity.db
+# Path to Pi-hole CLI executable
+pihole_bin = /usr/local/bin/pihole
+# Path to Pi-hole FTL binary (optional, used for syntax validation)
+pihole_ftl_bin = /usr/bin/pihole-FTL
+# If Pi-hole runs inside Docker on this host, uncomment and set container name:
+# docker_container = pihole
+
+[api]
+# Base URL for remote Pi-hole v6 REST API
+url = http://127.0.0.1/api
+# Web interface password or application API token
+password = 
+# Or specify environment variable containing the API token:
+# token_env = PIHOLE_API_TOKEN
+# Verify SSL/TLS certificates when connecting via HTTPS
+verify_ssl = true
+# HTTP request timeout in seconds
+timeout_seconds = 15
+
+[sync]
+# Location of the adlist domain list file
+adlist_file = /var/lib/admiral_detector/admiral_domains.list
+# Path to the JSON output payload produced by admiral_detector
+payload_file = /run/admiral_detector/detected_domains.json
+# Comment prefix for staged wildcard denylist domains (a domain integrity hash is appended)
+comment_prefix = admiral_detector:staged
+# Comment attached to the registered Pi-hole adlist
+adlist_comment = Admiral Detector domains
+# Lock file path to prevent concurrent sync operations
+lock_file = /run/admiral_detector/pihole-sync.lock
+# Maximum number of domains to pass to Pi-hole CLI per batch
+batch_size = 50

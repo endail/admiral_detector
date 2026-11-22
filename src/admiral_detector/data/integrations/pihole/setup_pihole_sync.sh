@@ -8,6 +8,7 @@ readonly SERVICE_GROUP="admiral";
 
 readonly POST_SCRIPT_NAME="99-update-admiral-adlist.sh";
 readonly POST_SCRIPT_DEST="/etc/admiral_detector/post.d/${POST_SCRIPT_NAME}";
+readonly PIHOLE_CONFIG_DEST="/etc/admiral_detector/pihole.conf";
 
 readonly SYNC_HELPER_NAME="admiral-pihole-sync";
 readonly SYNC_HELPER_DEST="/usr/local/sbin/${SYNC_HELPER_NAME}";
@@ -82,6 +83,37 @@ install_files() {
 
     install -o root -g "${SERVICE_GROUP}" -m 0750 "${SCRIPT_DIR}/${POST_SCRIPT_NAME}" "${POST_SCRIPT_DEST}";
     echo "Installed ${POST_SCRIPT_DEST}";
+
+    if [[ ! -f "${PIHOLE_CONFIG_DEST}" ]]; then
+        cat << 'EOF' > "${PIHOLE_CONFIG_DEST}"
+[pihole]
+mode = local
+
+[local]
+gravity_db = /etc/pihole/gravity.db
+pihole_bin = /usr/local/bin/pihole
+pihole_ftl_bin = /usr/bin/pihole-FTL
+
+[api]
+url = http://127.0.0.1/api
+password = 
+verify_ssl = true
+timeout_seconds = 15
+
+[sync]
+adlist_file = /var/lib/admiral_detector/admiral_domains.list
+payload_file = /run/admiral_detector/detected_domains.json
+comment_prefix = admiral_detector:staged
+adlist_comment = Admiral Detector domains
+lock_file = /run/admiral_detector/pihole-sync.lock
+batch_size = 50
+EOF
+        chown root:"${SERVICE_GROUP}" "${PIHOLE_CONFIG_DEST}"
+        chmod 0640 "${PIHOLE_CONFIG_DEST}"
+        echo "Created Pi-hole sync configuration: ${PIHOLE_CONFIG_DEST}"
+    else
+        echo "Existing Pi-hole configuration preserved: ${PIHOLE_CONFIG_DEST}"
+    fi
 
     install -o root -g root -m 0755 "${SCRIPT_DIR}/${SYNC_HELPER_NAME}" "${SYNC_HELPER_DEST}";
     echo "Installed ${SYNC_HELPER_DEST}";

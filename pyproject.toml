@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 admiral-detector = "admiral_detector.cli:main"
 admiral-detector-setup = "admiral_detector.setup_cli:main"
+admiral-pihole-sync = "admiral_detector.pihole.sync:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -21,6 +21,7 @@ SYNC_HELPER_DEST = "/usr/local/sbin/admiral-pihole-sync"
 
 CONFIG_DIR = "/etc/admiral_detector"
 CONFIG_FILE = f"{CONFIG_DIR}/admiral_detector.conf"
+PIHOLE_CONFIG_FILE = f"{CONFIG_DIR}/pihole.conf"
 POST_SCRIPT_DIR = f"{CONFIG_DIR}/post.d"
 POST_SCRIPT_NAME = "99-update-admiral-adlist.sh"
 POST_SCRIPT_DEST = f"{POST_SCRIPT_DIR}/{POST_SCRIPT_NAME}"
@@ -34,6 +35,7 @@ ADLIST_FILE = f"{STATE_DIR}/admiral_domains.list"
 ADLIST_URI = f"file://{ADLIST_FILE}"
 ADLIST_COMMENT = "Admiral Detector domains"
 STAGED_COMMENT = "Admiral Detector staged"
+COMMENT_PREFIX = "admiral_detector:staged"
 WILDCARD_DOMAIN_TYPE = 3
 
 PIHOLE_BIN = "/usr/local/bin/pihole"
@@ -72,6 +74,29 @@ file = {LOG_DIR}/admiral_detector.log
 
 [publishers]
 techcrunch.com
+"""
+
+DEFAULT_PIHOLE_CONFIG_TEMPLATE = f"""[pihole]
+mode = local
+
+[local]
+gravity_db = {GRAVITY_DB}
+pihole_bin = {PIHOLE_BIN}
+pihole_ftl_bin = /usr/bin/pihole-FTL
+
+[api]
+url = http://127.0.0.1/api
+password = 
+verify_ssl = true
+timeout_seconds = 15
+
+[sync]
+adlist_file = {ADLIST_FILE}
+payload_file = {DEFAULT_OUTPUT_FILE}
+comment_prefix = {COMMENT_PREFIX}
+adlist_comment = {ADLIST_COMMENT}
+lock_file = {RUNTIME_DIR}/pihole-sync.lock
+batch_size = 50
 """
 #endregion
 
@@ -252,16 +277,22 @@ def setup_core_detector(source_bin: str) -> None:
 def setup_pihole_sync() -> None:
 
     print("\n--- Configuring Pi-hole Sync Integration ---")
-    if(not os.path.isfile(PIHOLE_BIN) or not os.access(PIHOLE_BIN, os.X_OK)):
-        raise FileNotFoundError(f"Pi-hole CLI not found at {PIHOLE_BIN}.")
-
-    if(not os.path.isfile(GRAVITY_DB)):
-        raise FileNotFoundError(f"Pi-hole gravity database not found at {GRAVITY_DB}.")
-
     uid, gid = ensure_service_account()
     ensure_directory(CONFIG_DIR, 0, gid, DIR_MODE_RESTRICTED)
     ensure_directory(POST_SCRIPT_DIR, 0, gid, DIR_MODE_RESTRICTED)
     ensure_directory(STATE_DIR, uid, gid, DIR_MODE_PUBLIC)
+
+    if(not os.path.exists(PIHOLE_CONFIG_FILE)):
+        write_file_atomic(
+            PIHOLE_CONFIG_FILE,
+            DEFAULT_PIHOLE_CONFIG_TEMPLATE.encode("utf-8"),
+            0,
+            gid,
+            FILE_MODE_CONFIG,
+        )
+        print(f"Created default Pi-hole sync configuration: {PIHOLE_CONFIG_FILE}")
+    else:
+        print(f"Existing Pi-hole configuration preserved: {PIHOLE_CONFIG_FILE}")
 
     if(not os.path.exists(ADLIST_FILE)):
         write_file_atomic(ADLIST_FILE, b"", uid, gid, FILE_MODE_ADLIST)
@@ -278,13 +309,16 @@ def setup_pihole_sync() -> None:
     write_file_atomic(SYNC_HELPER_DEST, helper_bytes, 0, 0, FILE_MODE_EXEC)
     print(f"Installed {SYNC_HELPER_DEST}")
 
-    with sqlite3.connect(GRAVITY_DB) as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO adlist (address, enabled, comment) VALUES (?, 1, ?)",
-            (ADLIST_URI, ADLIST_COMMENT),
-        )
-        conn.commit()
-    print(f"Registered adlist in Pi-hole: {ADLIST_URI}")
+    if(os.path.isfile(GRAVITY_DB)):
+        with sqlite3.connect(GRAVITY_DB) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO adlist (address, enabled, comment) VALUES (?, 1, ?)",
+                (ADLIST_URI, ADLIST_COMMENT),
+            )
+            conn.commit()
+        print(f"Registered adlist in Pi-hole: {ADLIST_URI}")
+    else:
+        print(f"Local gravity.db not found at {GRAVITY_DB}. If using remote Pi-hole API, configure {PIHOLE_CONFIG_FILE}.")
 
     for unit_name in (PIHOLE_SYNC_SERVICE_UNIT, PIHOLE_SYNC_PATH_UNIT):
         unit_bytes = read_packaged_asset(f"data/integrations/pihole/{unit_name}")
@@ -329,8 +363,8 @@ def uninstall_pihole_sync() -> None:
                 db_changed = True
 
             cursor.execute(
-                "DELETE FROM domainlist WHERE type = ? AND comment = ?",
-                (WILDCARD_DOMAIN_TYPE, STAGED_COMMENT),
+                "DELETE FROM domainlist WHERE type = ? AND (comment = ? OR comment LIKE ?)",
+                (WILDCARD_DOMAIN_TYPE, STAGED_COMMENT, f"{COMMENT_PREFIX}:%"),
             )
             if(cursor.rowcount > 0):
                 db_changed = True
